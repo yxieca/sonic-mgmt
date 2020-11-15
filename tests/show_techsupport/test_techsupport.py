@@ -279,7 +279,9 @@ def test_techsupport(request, config, duthosts, rand_one_dut_hostname):
     for i in range(loop_range):
         logger.debug("Running show techsupport ... ")
         wait_until(300, 20, execute_command, duthost, str(since))
-        tar_file = [j for j in pytest.tar_stdout.split('\n') if j != ''][-1]
-        stdout = duthost.command("rm -rf {}".format(tar_file))
+        tar_files = [j for j in pytest.tar_stdout.split('\n') if j != '']
+        if tar_files:
+            tar_file = [j for j in pytest.tar_stdout.split('\n') if j != ''][-1]
+            stdout = duthost.command("rm -rf {}".format(tar_file))
         logger.debug("Sleeping for {} seconds".format(loop_delay))
         time.sleep(loop_delay)
