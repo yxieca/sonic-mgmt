@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import ptf.testutils as testutils
 from tests.common.plugins import ptfadapter
+from tests.common.helpers.assertions import pytest_assert
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,9 @@ def vlan_ping_setup(duthosts, rand_one_dut_hostname, ptfhost, nbrhosts, tbinfo):
         ptfhost_info[member]["ipv6"] = str(
             ipaddress.IPv6Interface(ip6).network[ptfhost_info[member]["port_index"]])
 
+    pytest_assert("port_index" in vm_host_info, "Key 'port_index' is missing from vm host info {}".format(vm_host_info))
+    for member in ptfhost_info:
+        pytest_assert("port_index" in ptfhost_info[member], "Key 'port_index' is missing from ptf host info of {} : {}".format(member, ptfhost_info[member]))
     return vm_host_info, ptfhost_info
 
 
