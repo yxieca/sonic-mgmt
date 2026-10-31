@@ -17,9 +17,7 @@ from tests.common.fixtures.grpc_fixtures import (  # noqa: F401
     _restart_gnoi_server,
     gnmi_original_service_verifier,
 )
-from tests.common.fixtures.grpc_fixtures import (  # noqa: F401
-    gnmi_same_image_tls as gnmi_tls,
-)
+from tests.common.fixtures.grpc_fixtures import gnmi_same_image_tls as gnmi_tls  # noqa: F401
 from tests.common.helpers.assertions import pytest_assert
 from tests.common.helpers.gnmi_audit import (
     RPC_COMPLETION_PREFIX,
@@ -252,7 +250,11 @@ def test_gnmi_audit_log_remote_forwarding(gnmi_tls, ptfhost, operation, method):
     duthost = gnmi_tls.duthost
     syslog_vrf = "mgmt" if is_mgmt_vrf_enabled(duthost) else None
 
-    with capture_remote_syslog(duthost, ptfhost.mgmt_ip, vrf=syslog_vrf) as (capture_result, capture_file):
+    configuration = gnmi_tls._same_image_state.remote_syslog(ptfhost.mgmt_ip, vrf=syslog_vrf)
+    with capture_remote_syslog(duthost, ptfhost.mgmt_ip, vrf=syslog_vrf, configuration=configuration) as (
+        capture_result,
+        capture_file,
+    ):
         offset = get_audit_log_offset(duthost)
         with allure.step("Generate a {} audit record".format(method)):
             operation(gnmi_tls.pygnmi_client)

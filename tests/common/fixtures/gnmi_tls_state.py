@@ -5,6 +5,7 @@ Only fixed program text, paths, status and explicitly public Capabilities cross 
 for baseline verifier, metadata, transport qualification and recovery limits.
 """
 import base64
+from contextlib import contextmanager
 import inspect
 import shlex
 import shutil
@@ -16,7 +17,7 @@ from tests.common.platform.processes_utils import wait_critical_processes
 from tests.common.utilities import wait_until
 
 
-def _remote(root, action, paths):
+def _remote(root, action, paths, syslog_spec=None):
     """Secret-free program, executed as root; never return snapshot contents."""
     import array
     import base64
@@ -168,6 +169,19 @@ def _remote(root, action, paths):
                 # table/row; unrelated rows/fields above are never removed.
                 del value[table]
         value.pop('GNMI_CLIENT_CERT', None)
+        # Only an explicitly registered destination, and only its declared
+        # states, may differ. Never mask the SYSLOG_SERVER table or extra fields.
+        if os.path.exists(root + '/syslog.json'):
+            owned = load('syslog.json')
+            table = value.get('SYSLOG_SERVER', {})
+            if not isinstance(table, dict):
+                raise RuntimeError('invalid persistent syslog table')
+            row = [owned['destination'] in table, table.get(owned['destination'])]
+            if row not in owned['persistent_states']:
+                raise RuntimeError('unowned persistent syslog destination drift')
+            table.pop(owned['destination'], None)
+            if not table:
+                value.pop('SYSLOG_SERVER', None)
         return value
 
     def persistent_check(exact=False):
@@ -210,6 +224,8 @@ def _remote(root, action, paths):
 
     def persistent_restore():
         same_image()  # In the actual action, before ANY persistent write.
+        if os.path.exists(root + '/syslog.json') and syslog_raw(db()) != load('syslog-original.json'):
+            raise RuntimeError('syslog context did not restore original raw state')
         saved, current = persistent_check()
         if saved == current:
             return
@@ -362,6 +378,47 @@ def _remote(root, action, paths):
         else:
             conn.hset(metadata_key, 'cloudtype', base64.b64decode(saved['cloudtype']))
 
+    def syslog_raw(conn):
+        return {pack(key): {pack(k): pack(v) for k, v in conn.hgetall(key).items()}
+                for key in conn.keys('SYSLOG_SERVER|*')}
+
+    def syslog_check(conn, owned):
+        current = syslog_raw(conn)
+        original = load('syslog-original.json')
+        key = owned['key']
+        row = current.pop(key, {})
+        original.pop(key, None)
+        if current != original or row not in (owned['raw'], owned['temporary']):
+            raise RuntimeError('unowned running syslog drift')
+        return row
+
+    def syslog_write(conn, owned, target):
+        same_image()
+        persistent_check()  # Including unrelated destinations, BEFORE writes.
+        current = syslog_check(conn, owned)
+        key = base64.b64decode(owned['key'])
+        # Atomic exact-row replacement, with a compare-and-swap on that row.
+        # Values stay in redis-py/private memory, never CLI argv or SWSS logs.
+        with conn.pipeline() as transaction:
+            transaction.watch(key)
+            if transaction.hgetall(key) != {base64.b64decode(k): base64.b64decode(v)
+                                            for k, v in current.items()}:
+                raise RuntimeError('concurrent syslog destination write')
+            same_image()
+            transaction.multi()
+            transaction.delete(key)
+            if target:
+                transaction.hset(key, mapping={base64.b64decode(k): base64.b64decode(v)
+                                               for k, v in target.items()})
+            transaction.execute()
+        if syslog_check(conn, owned) != target:
+            raise RuntimeError('syslog destination restoration mismatch')
+        same_image()
+        # Match the CLI's explicit reload; row notifications alone are not a
+        # readiness contract. The capture helper still checks UDP/514 action.
+        command(['systemctl', 'reset-failed', 'rsyslog-config', 'rsyslog'])
+        command(['systemctl', 'restart', 'rsyslog-config'])
+
     def config():
         from generic_config_updater.generic_updater import get_config_json
         return get_config_json()
@@ -381,10 +438,43 @@ def _remote(root, action, paths):
         save('image.json', image())
         save('endpoint.json', endpoint())
         save('config.json', config())
-        save('raw.json', raw(db()))
+        conn = db()
+        save('raw.json', raw(conn))
+        save('syslog-original.json', syslog_raw(conn))
         saved = persistent_snapshot()
         persistent_json(saved)  # Admission validates JSON before test mutation.
         save('persistent.json', saved)
+    elif action == 'syslog-save':
+        same_image()
+        persistent_check(exact=True)
+        # Public destination/VRF only. Exactly one context per fresh AAA owner;
+        # exclusive save refuses a second registration or rebasing after failure.
+        destination, vrf = syslog_spec
+        if str(ipaddress.ip_address(destination)) != destination or vrf not in (None, 'mgmt'):
+            raise RuntimeError('unsupported syslog capture destination or VRF')
+        conn = db()
+        original = syslog_raw(conn)
+        if original != load('syslog-original.json'):
+            raise RuntimeError('running syslog drift before ownership')
+        key = pack(('SYSLOG_SERVER|' + destination).encode())
+        temporary = {'port': '514'}
+        if vrf is not None:
+            temporary['vrf'] = vrf
+        startup = persistent_json(load('persistent.json')).get('SYSLOG_SERVER', {})
+        # Use the host/default namespace, matching db() and config_db.json.
+        # GCU's config() nests namespaces on multi-ASIC devices.
+        running = json.loads(command(['sonic-cfggen', '-d', '--print-data'])).get('SYSLOG_SERVER', {})
+        if not isinstance(startup, dict) or not isinstance(running, dict):
+            raise RuntimeError('invalid syslog table')
+        save('syslog.json', dict(destination=destination, key=key, raw=original.get(key, {}),
+                                 temporary={pack(k.encode()): pack(v.encode()) for k, v in temporary.items()},
+                                 persistent_states=[[destination in startup, startup.get(destination)],
+                                                    [destination in running, running.get(destination)],
+                                                    [True, temporary]]))
+    elif action in ('syslog-apply', 'syslog-restore'):
+        same_image()
+        owned = load('syslog.json')
+        syslog_write(db(), owned, owned['temporary'] if action == 'syslog-apply' else owned['raw'])
     elif action == 'persistent-check':
         same_image()
         persistent_check()
@@ -444,8 +534,11 @@ def _remote(root, action, paths):
     elif action == 'config':
         same_image()
         persistent_check()  # Refuse unrelated startup drift before owned restoration.
-        # Only owned raw hashes/cloudtype; no GCU patch-value syslog logging.
+        # A failed forwarding context must not be hidden by outer recovery.
         conn = db()
+        if os.path.exists(root + '/syslog.json') and syslog_raw(conn) != load('syslog-original.json'):
+            raise RuntimeError('syslog context did not restore original raw state')
+        # Only owned raw hashes/cloudtype; no GCU patch-value syslog logging.
         failures = []
         saved = load('raw.json')
         for key in set(raw(conn)['hashes']) - set(saved['hashes']):
@@ -511,12 +604,12 @@ class RemoteState:
         self.root = '/var/tmp/gnmi-restore-' + uuid.uuid4().hex
         self.run('init')
 
-    def run(self, action):
+    def run(self, action, syslog_spec=None):
         # Program contains paths, never payloads. Bootstrap failures before the
         # protected fd exists have read no secrets. Ansible stderr is suppressed
         # as an additional boundary (not a substitute for private child output).
-        source = inspect.getsource(_remote) + '\n_remote({!r}, {!r}, {!r})'.format(
-            self.root, action, self.paths)
+        source = inspect.getsource(_remote) + '\n_remote({!r}, {!r}, {!r}, {!r})'.format(
+            self.root, action, self.paths, syslog_spec)
         try:
             redirect = ' 2>/dev/null' if action == 'capabilities' else ' >/dev/null 2>&1'
             result = self.host.shell('python3 -c ' + shlex.quote(source) + redirect,
@@ -587,6 +680,19 @@ class NativeTlsState:
             return self.verifier() is True
         except BaseException:
             return False
+
+    @contextmanager
+    def remote_syslog(self, destination, vrf=None):
+        # Registration has no DUT config writes. Once it succeeds, restoration
+        # runs even when apply partially fails or pytest raises BaseException.
+        self.dut_files.run('syslog-save', (destination, vrf))
+        try:
+            self.dut_files.run('syslog-apply')
+            yield
+        finally:
+            self.dut_files.run('syslog-restore')
+        # Persistent restoration belongs to the enclosing native owner, after
+        # stopping its writer. Keep the exact-row declaration until then.
 
     def case_save(self):
         self.dut_files.run('case-save')

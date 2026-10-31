@@ -3,6 +3,7 @@ import ast
 import base64
 import builtins
 from copy import deepcopy
+from contextlib import contextmanager, ExitStack
 import io
 import json
 import os
@@ -26,8 +27,8 @@ GRPC = SOURCE.with_name('grpc_fixtures.py')
 def load():
     tree = ast.parse(SOURCE.read_text())
     tree.body = [node for node in tree.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
-    ns = dict(base64=base64, inspect=inspect, shlex=shlex, shutil=shutil, tempfile=tempfile, uuid=uuid,
-              wait_until=lambda timeout, interval, delay, fn: fn())
+    ns = dict(base64=base64, contextmanager=contextmanager, inspect=inspect, shlex=shlex, shutil=shutil,
+              tempfile=tempfile, uuid=uuid, wait_until=lambda timeout, interval, delay, fn: fn())
     exec(compile(tree, str(SOURCE), 'exec'), ns)
     ns['grpc_config'] = SimpleNamespace(DUT_CERT_DIR='/certs',
                                         get_dut_cert_paths=lambda: {'key': '/certs/key'},
@@ -237,8 +238,8 @@ class RawRedis:
         return value.encode() if isinstance(value, str) else value
 
     def keys(self, pattern):
-        assert pattern == 'GNMI_CLIENT_CERT|*'
-        return [k for k in self.data if k.startswith(b'GNMI_CLIENT_CERT|')]
+        assert pattern in ('GNMI_CLIENT_CERT|*', 'SYSLOG_SERVER|*')
+        return [k for k in self.data if k.startswith(pattern[:-1].encode())]
 
     def hgetall(self, key):
         return deepcopy(self.data.get(self.b(key), {}))
@@ -259,6 +260,41 @@ class RawRedis:
         if self.corrupt and value == b'None':
             value = b''
         self.data.setdefault(self.b(key), {})[self.b(field)] = value
+
+    def pipeline(self):
+        conn = self
+
+        class Transaction:
+            def __init__(self):
+                self.pending = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def watch(self, key):
+                self.key, self.original = key, conn.hgetall(key)
+
+            def hgetall(self, key):
+                return conn.hgetall(key)
+
+            def multi(self):
+                pass
+
+            def delete(self, key):
+                self.pending.append(lambda: conn.delete(key))
+
+            def hset(self, key, mapping):
+                self.pending.append(lambda: [conn.hset(key, f, v) for f, v in mapping.items()])
+
+            def execute(self):
+                if conn.hgetall(self.key) != self.original:
+                    raise RuntimeError('synthetic watch conflict')
+                for operation in self.pending:
+                    operation()
+        return Transaction()
 
     def hdel(self, key, field):
         self.writes.append(('hdel', key, field))
@@ -299,9 +335,9 @@ def production_remote(tmp_path, monkeypatch):
         return original_open(path, mode, *args, **kwargs)
 
     def lstat(path, *args, **kwargs):
-        if str(path) == str(root):
+        if str(path) == str(env.root):
             return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
-        if str(path) in [str(p) for p in root.parents]:
+        if str(path) in [str(p) for p in env.root.parents]:
             return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
         return original_lstat(path, *args, **kwargs)
 
@@ -313,6 +349,10 @@ def production_remote(tmp_path, monkeypatch):
             return b'container-image'
         if argv == ['ss', '-H', '-ltnp']:
             return env.listeners.encode()
+        if argv[0] == 'systemctl':
+            return b''
+        if argv == ['sonic-cfggen', '-d', '--print-data']:
+            return json.dumps(env.decoded()).encode()
         raise AssertionError('unexpected command')
 
     def connect(**kwargs):
@@ -323,9 +363,16 @@ def production_remote(tmp_path, monkeypatch):
     def decoded():
         # Independent cfggen representation deliberately hides literal None and
         # NULL. Equality here CANNOT detect corrupted original raw values.
-        return {k.decode(): {f.decode(): '' if v == b'None' else v.decode(errors='replace')
-                             for f, v in fields.items() if f != b'NULL'}
-                for k, fields in conn.data.items() if fields}
+        def fields_decoded(fields):
+            return {f.decode(): '' if v == b'None' else v.decode(errors='replace')
+                    for f, v in fields.items() if f != b'NULL'}
+        result = {k.decode(): fields_decoded(fields) for k, fields in conn.data.items()
+                  if fields and not k.startswith(b'SYSLOG_SERVER|')}
+        syslog = {k.decode().split('|', 1)[1]: fields_decoded(fields) for k, fields in conn.data.items()
+                  if fields and k.startswith(b'SYSLOG_SERVER|')}
+        if syslog:
+            result['SYSLOG_SERVER'] = syslog
+        return result
 
     swss = ModuleType('swsscommon.swsscommon')
     swss.SonicDBConfig = SimpleNamespace(getDbSock=lambda _: '/synthetic/redis.sock', getDbId=lambda _: 4)
@@ -377,7 +424,7 @@ def production_remote(tmp_path, monkeypatch):
     monkeypatch.setattr('fcntl.ioctl', lambda *args: None)  # Linux metadata capability modeled on macOS.
     monkeypatch.setattr(os, 'listxattr', lambda *args, **kwargs: [], raising=False)
     monkeypatch.setattr(os, 'fchown', lambda *args: None)  # Fixture files already belong to this uid/gid.
-    env.run = lambda action: ns['_remote'](str(root), action, [])
+    env.run = lambda action, spec=None: ns['_remote'](str(env.root), action, [], spec)
     env.decoded = decoded
     env.ns = ns
     return env
@@ -783,3 +830,564 @@ def test_production_no_owned_semantic_delta_does_not_hide_file_drift(production_
     with pytest.raises(RuntimeError, match='unexplained persistent'):
         env.run('persistent-restore')
     assert persistent_identity(env.persistent) == expected
+
+
+DESTINATION = '192.0.2.18'
+SYSLOG_KEY = ('SYSLOG_SERVER|' + DESTINATION).encode()
+OTHER_SYSLOG_KEY = b'SYSLOG_SERVER|192.0.2.19'
+
+
+def startup_evidence(path):
+    info = path.stat()
+    return path.read_bytes(), info.st_mode, info.st_uid, info.st_gid, info.st_mtime_ns
+
+
+def forwarding_owner(env):
+    state = env.ns['NativeTlsState'].__new__(env.ns['NativeTlsState'])
+    state.dut_files = SimpleNamespace(run=env.run)
+    return state
+
+
+def seed_forwarding(env, raw=None, startup=None):
+    env.conn.data[OTHER_SYSLOG_KEY] = {b'port': b'6514', b'extra': b'None'}
+    if raw is not None:
+        env.conn.data[SYSLOG_KEY] = raw
+    value = {'SYSLOG_SERVER': {'192.0.2.19': {'port': '6514', 'extra': 'unrelated'}},
+             'FEATURE': {'unchanged': {'state': 'enabled'}}}
+    if startup is not None:
+        value['SYSLOG_SERVER'][DESTINATION] = startup
+    seed_persistent(env, value)
+    return value
+
+
+@pytest.mark.parametrize('vrf', [None, 'mgmt'])
+@pytest.mark.parametrize('raw', [
+    None, {b'NULL': b'NULL'}, {b'extra': b'None'}, {b'extra': b''},
+    {b'vrf': b'other', b'port': b'6514', b'source': b'192.0.2.22', b'extra': b'NULL'},
+])
+@pytest.mark.parametrize('startup', [
+    None, {}, {'extra': ''}, {'extra': 'None'}, {'extra': 'NULL'},
+    {'port': '10514', 'vrf': 'startup', 'private': 'synthetic'},
+])
+def test_forward_get_then_set_production_actions_restore_independent_originals(production_remote, vrf, raw, startup):
+    env = production_remote
+    original = seed_forwarding(env, raw, startup)
+    expected_file = startup_evidence(env.persistent)
+    expected_raw = deepcopy(env.conn.data)
+    for operation in ('get', 'set'):
+        if operation == 'set':
+            env.root = env.root.with_name('second-private-owner')
+            env.root.mkdir(mode=0o700)
+        env.run('baseline')
+        owner = forwarding_owner(env)
+        with owner.remote_syslog(DESTINATION, vrf):
+            temporary = {b'port': b'514'}
+            if vrf:
+                temporary[b'vrf'] = vrf.encode()
+            assert env.conn.data[SYSLOG_KEY] == temporary
+            if operation == 'set':
+                saved = deepcopy(original)
+                saved['SYSLOG_SERVER'][DESTINATION] = {k.decode(): v.decode() for k, v in temporary.items()}
+                saved['GNMI'] = {'gnmi': {'port': '50052'}}
+                env.persistent.write_text(json.dumps(saved))
+        # Context restores running BEFORE outer owner restores persistent state.
+        assert env.conn.data == expected_raw
+        env.run('config')
+        env.run('persistent-restore')
+        assert startup_evidence(env.persistent) == expected_file
+        assert env.conn.data == expected_raw
+        assert env.output == []
+        assert 'synthetic' not in repr(env.commands)
+
+
+@pytest.mark.parametrize('drift', ['other-running', 'other-running-normalized', 'owned-running-extra',
+                                   'other-startup', 'owned-startup-extra', 'owned-startup-port'])
+@pytest.mark.parametrize('action', ['syslog-restore', 'config', 'persistent-restore'])
+def test_forwarding_never_blesses_unknown_rows_or_fields(production_remote, drift, action):
+    env = production_remote
+    original = seed_forwarding(env)
+    env.run('baseline')
+    env.run('syslog-save', (DESTINATION, None))
+    env.run('syslog-apply')
+    env.run('syslog-restore')
+    if drift.startswith('other-running'):
+        env.conn.data[OTHER_SYSLOG_KEY][b'extra'] = b'' if drift.endswith('normalized') else b'changed'
+    elif drift == 'owned-running-extra':
+        env.conn.data[SYSLOG_KEY] = {b'port': b'514', b'unknown': b'None'}
+    else:
+        changed = deepcopy(original)
+        changed['SYSLOG_SERVER'][DESTINATION] = {'port': '514'}
+        if drift == 'other-startup':
+            changed['SYSLOG_SERVER']['192.0.2.19']['extra'] = 'changed'
+        elif drift == 'owned-startup-extra':
+            changed['SYSLOG_SERVER'][DESTINATION]['extra'] = 'unknown'
+        else:
+            changed['SYSLOG_SERVER'][DESTINATION]['port'] = '6514'
+        env.persistent.write_text(json.dumps(changed))
+    env.conn.writes.clear()
+    before = startup_evidence(env.persistent)
+    # persistent-restore is file-only; its raw-state gate is required too.
+    with pytest.raises(RuntimeError):
+        env.run(action)
+    assert env.conn.writes == [] and startup_evidence(env.persistent) == before
+    assert env.output == []
+
+
+@pytest.mark.parametrize('action', ['syslog-save', 'syslog-apply', 'syslog-restore'])
+def test_forwarding_image_change_precedes_writes_and_commands(production_remote, action):
+    env = production_remote
+    seed_forwarding(env)
+    env.run('baseline')
+    if action != 'syslog-save':
+        env.run('syslog-save', (DESTINATION, None))
+    if action == 'syslog-restore':
+        env.run('syslog-apply')
+    env.image = 'replacement'
+    env.conn.writes.clear()
+    env.commands.clear()
+    original = startup_evidence(env.persistent)
+    with pytest.raises(RuntimeError, match='image changed'):
+        env.run(action, (DESTINATION, None))
+    assert not env.conn.writes and startup_evidence(env.persistent) == original
+    assert not any(command[0] == 'systemctl' for command in env.commands)
+
+
+@pytest.mark.parametrize('exception', [ValueError, pytest.fail.Exception])
+@pytest.mark.parametrize('failure', ['apply', 'body', 'restore'])
+def test_forwarding_owner_finally_preserves_failures(owner, failure, exception):
+    _, state, events = owner
+
+    def run(action, spec=None):
+        events.append(action)
+        if action == 'syslog-' + failure:
+            raise exception('synthetic-' + failure)
+    state.dut_files.run.side_effect = run
+    with pytest.raises(exception, match='synthetic-' + failure):
+        with state.remote_syslog(DESTINATION):
+            if failure == 'body':
+                raise exception('synthetic-body')
+    assert events == ['syslog-save', 'syslog-apply', 'syslog-restore']
+
+
+def test_forwarding_production_apply_failure_after_write_still_restores(production_remote, monkeypatch):
+    env = production_remote
+    seed_forwarding(env, {b'vrf': b'original', b'port': b'6514', b'NULL': b'None'})
+    expected = deepcopy(env.conn.data)
+    env.run('baseline')
+    check_output = __import__('subprocess').check_output
+    failed = []
+
+    def fail_reload(argv, **kwargs):
+        if argv == ['systemctl', 'restart', 'rsyslog-config'] and not failed:
+            failed.append(True)
+            raise RuntimeError('synthetic apply reload failure')
+        return check_output(argv, **kwargs)
+    monkeypatch.setattr('subprocess.check_output', fail_reload)
+    with pytest.raises(RuntimeError, match='apply reload failure'):
+        with forwarding_owner(env).remote_syslog(DESTINATION):
+            pytest.fail('must not enter body')
+    assert env.conn.data == expected
+    assert env.output == []
+
+
+def test_forwarding_registration_is_exclusive_before_mutation(production_remote):
+    env = production_remote
+    seed_forwarding(env)
+    env.run('baseline')
+    env.run('syslog-save', (DESTINATION, None))
+    with pytest.raises(FileExistsError):
+        env.run('syslog-save', (DESTINATION, None))
+    assert env.conn.writes == []
+
+
+def test_forwarding_no_registration_means_no_syslog_ownership(production_remote):
+    env = production_remote
+    original = seed_forwarding(env)
+    env.run('baseline')
+    original['SYSLOG_SERVER'][DESTINATION] = {'port': '514'}
+    env.persistent.write_text(json.dumps(original))
+    with pytest.raises(RuntimeError, match='unrelated persistent'):
+        env.run('persistent-restore')
+    assert env.conn.writes == []
+
+
+def load_capture(namespace):
+    path = SOURCE.parents[1] / 'helpers/syslog_helpers.py'
+    tree = ast.parse(path.read_text())
+    tree.body = [node for node in tree.body if getattr(node, 'name', '') == 'capture_remote_syslog']
+    namespace.update(contextmanager=contextmanager, ExitStack=ExitStack, os=os, shlex=shlex, uuid=uuid,
+                     SYSLOG_CAPTURE_SECONDS=60, wait_until=lambda timeout, interval, delay, fn: fn(),
+                     pytest_assert=lambda condition, message: pytest.fail(message) if not condition else None)
+    exec(compile(tree, str(path), 'exec'), namespace)
+    return namespace['capture_remote_syslog']
+
+
+@pytest.mark.parametrize('failure', ['action', 'capture-start', 'body', 'ready', 'close', 'join', 'remove', None])
+@pytest.mark.parametrize('exception', [ValueError, pytest.fail.Exception])
+def test_capture_finally_restores_configuration_after_any_failure(owner, failure, exception):
+    _, state, events = owner
+    state.dut_files.run.side_effect = lambda action, spec=None: events.append(action)
+    pool, result, dut = Mock(), Mock(), Mock()
+    result.ready.return_value = True
+    namespace = {'add_syslog_server': Mock(), 'del_syslog_server': Mock()}
+    capture = load_capture(namespace)
+
+    def shell(command, **kwargs):
+        if command.startswith('grep') and failure == 'action':
+            raise exception('synthetic-action')
+        if kwargs.get('module_async'):
+            assert 'timeout 60 tcpdump' in command
+            return pool, result
+        if command.startswith('sudo test') and failure == 'capture-start':
+            raise exception('synthetic-capture-start')
+        if command.startswith('sudo rm') and failure == 'remove':
+            raise exception('synthetic-remove')
+        return {'rc': 0}
+    dut.shell.side_effect = shell
+    if failure in ('ready', 'close', 'join'):
+        {'ready': result.ready, 'close': pool.close, 'join': pool.join}[failure].side_effect = exception('synthetic')
+
+    def run():
+        with capture(dut, DESTINATION, configuration=state.remote_syslog(DESTINATION)):
+            events.append('body')
+            if failure == 'body':
+                raise exception('synthetic-body')
+    if failure:
+        with pytest.raises(exception):
+            run()
+    else:
+        run()
+    assert events[:2] == ['syslog-save', 'syslog-apply']
+    assert events[-1] == 'syslog-restore'
+    namespace['add_syslog_server'].assert_not_called()
+    namespace['del_syslog_server'].assert_not_called()
+
+
+def test_legacy_capture_keeps_default_add_delete_contract():
+    namespace = {'add_syslog_server': Mock(return_value={'rc': 0}), 'del_syslog_server': Mock()}
+    capture = load_capture(namespace)
+    pool, result, dut = Mock(), Mock(), Mock()
+    result.ready.return_value = True
+    dut.shell.side_effect = lambda command, **kwargs: (pool, result) if kwargs.get('module_async') else {'rc': 0}
+    with capture(dut, DESTINATION, vrf='mgmt'):
+        pass
+    namespace['add_syslog_server'].assert_called_once_with(dut, DESTINATION, vrf='mgmt')
+    namespace['del_syslog_server'].assert_called_once_with(dut, DESTINATION, module_ignore_errors=True)
+
+
+@pytest.mark.parametrize('failure', [None, 'apply', 'body', 'capture-close', 'context-restore', 'image'])
+def test_real_pytest_forwarding_finally_before_native_restore_analyzer_and_generic(tmp_path, failure):
+    """Real pytest fixture scheduling + production actions, not a thrown yield.
+
+    Device filesystem/Redis/service APIs are synthetic. This does not qualify
+    real Redis transactions, rsyslog, private transport or a live semantic RPC.
+    """
+    import subprocess
+    import textwrap
+    prelude = '''
+import ast
+import importlib.util
+import json
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+import pytest
+spec = importlib.util.spec_from_file_location('adapter', ADAPTER)
+adapter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(adapter)
+production_remote = adapter.production_remote
+failure = FAILURE
+events = []
+
+def pytest_sessionfinish(session, exitstatus):
+    Path('events.json').write_text(json.dumps(events))
+
+'''
+    fixtures = textwrap.dedent('''
+        @pytest.fixture
+        def core_dump_and_config_check():
+            events.append('generic-start')
+            yield
+            events.append('generic-check')
+
+        @pytest.fixture
+        def loganalyzer(core_dump_and_config_check):
+            events.append('analyzer-start')
+            yield
+            events.append('analyzer-check')
+
+        @pytest.fixture
+        def duthosts(production_remote):
+            env = production_remote
+            original = adapter.seed_forwarding(env, {b'port': b'6514', b'extra': b'None'},
+                                               {'port': '1514', 'extra': 'NULL'})
+            expected_raw = deepcopy(env.conn.data)
+            expected_file = adapter.startup_evidence(env.persistent)
+            env.run('baseline')
+            (env.root / 'files.json').write_text('{}')
+            state = adapter.forwarding_owner(env)
+            state.dut = Mock()
+            state.ptf_files = SimpleNamespace(root='/synthetic-ptf', run=lambda action: events.append('ptf:' + action))
+            state.dut_files.root = str(env.root)
+            state.prepared = True
+            state.cert_dir = None
+            state.verifier = None
+            state.prepare = lambda: None  # Handshake setup tested elsewhere; isolate forwarding lifetime.
+            state.wait_ready = lambda: env.run('endpoint')
+            env.ns['wait_critical_processes'] = lambda dut: events.append('health')
+            actual = env.run
+            def run(action, spec=None):
+                events.append(action)
+                # Model only service supervisor API; all configuration/guard/
+                # persistent/file actions below execute the production program.
+                if action in ('stop', 'start', 'persistent-verify'):
+                    if action == 'persistent-verify':
+                        assert adapter.startup_evidence(env.persistent) == expected_file
+                    return
+                if action == 'syslog-apply' and failure == 'apply':
+                    actual(action, spec)
+                    pytest.fail('injected-apply')
+                if action == 'syslog-restore' and failure == 'context-restore':
+                    actual(action, spec)
+                    pytest.fail('injected-context-restore')
+                if action == 'discard':
+                    assert env.conn.data == expected_raw
+                    assert adapter.startup_evidence(env.persistent) == expected_file
+                    events.append('native-original-exact')
+                    return  # Keep private synthetic artifacts; root lstat is modeled.
+                return actual(action, spec)
+            state.dut_files.run = run
+            env.state = state
+            env.original = original
+            env.expected_raw = expected_raw
+            env.expected_file = expected_file
+            return [env]
+
+        @pytest.fixture
+        def ptfhost(): return Mock()
+        @pytest.fixture
+        def gnmi_original_service_verifier(): return None
+        def _get_target_duthost(duthosts, request): return duthosts[0]
+        def NativeTlsState(dut, ptf, verifier=None): return dut.state
+        def _establish_gnoi_tls_handshake(*args, **kwargs): pass
+        def _tls_client_fixture(dut, ptf, cert_dir):
+            return SimpleNamespace(duthost=dut, pygnmi_client=Mock())
+    ''')
+    tree = ast.parse(GRPC.read_text())
+    production = '\n\n'.join(ast.unparse(node) for node in tree.body
+                             if getattr(node, 'name', '') in ('_gnmi_same_image_tls_flow', 'gnmi_same_image_tls'))
+    prelude = prelude.replace('ADAPTER', repr(str(Path(__file__).resolve()))).replace('FAILURE', repr(failure))
+    (tmp_path / 'conftest.py').write_text(prelude + fixtures + production)
+    (tmp_path / 'pytest.ini').write_text('[pytest]\n')
+    (tmp_path / 'test_forwarding.py').write_text(textwrap.dedent('''
+        import json
+        from copy import deepcopy
+        from unittest.mock import Mock
+        import pytest
+        from conftest import adapter, events, failure
+
+        @pytest.mark.parametrize('operation', ['get', 'set'])
+        def test_forwarding(gnmi_same_image_tls, operation):
+            env = gnmi_same_image_tls.duthost
+            pool, result, dut = Mock(), Mock(), Mock()
+            result.ready.return_value = True
+            dut.shell.side_effect = lambda command, **kwargs: ((pool, result) if kwargs.get('module_async')
+                                                               else {'rc': 0})
+            if failure == 'capture-close':
+                pool.close.side_effect = pytest.fail.Exception('injected-capture-close')
+            capture = adapter.load_capture({})
+            with capture(dut, adapter.DESTINATION,
+                         configuration=env.state.remote_syslog(adapter.DESTINATION)):
+                events.append('body-' + operation)
+                if operation == 'set':
+                    current = deepcopy(env.original)
+                    current['SYSLOG_SERVER'][adapter.DESTINATION] = {'port': '514'}
+                    env.persistent.write_text(json.dumps(current))
+                if failure == 'body':
+                    pytest.fail('injected-body')
+                if failure == 'image':
+                    env.image = 'replacement'
+            assert env.conn.data == env.expected_raw
+            events.append('context-original-exact')
+    '''))
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', 'test_forwarding.py'],
+                            cwd=tmp_path, text=True, capture_output=True)
+    (tmp_path / 'subprocess-output.txt').write_text(result.stdout + result.stderr)
+    assert result.returncode == (0 if failure is None else 1), result.stdout + result.stderr
+    assert 'restoration failed: DUT recovery cleanup' not in result.stdout, result.stdout
+    if failure and failure != 'image':
+        assert 'injected-' + failure in result.stdout, result.stdout
+    events = json.loads((tmp_path / 'events.json').read_text())
+    assert events.count('analyzer-check') == events.count('generic-check') == 2
+    for start in [index for index, event in enumerate(events) if event == 'generic-start']:
+        finish = events.index('generic-check', start)
+        case = events[start:finish + 1]
+        assert case.index('syslog-restore') < case.index('image') < case.index('analyzer-check')
+        assert case[-1] == 'generic-check'
+        if failure != 'image':
+            assert case.index('syslog-restore') < case.index('config') < case.index('persistent-restore')
+            assert case.index('native-original-exact') < case.index('analyzer-check')
+        else:
+            assert 'config' not in case and 'persistent-restore' not in case
+            assert 'ptf:restore' in case
+
+
+@pytest.mark.parametrize('startup_kind', ['absent-file', 'absent-table', 'empty-table', 'null-row', 'symlink'])
+def test_forwarding_preserves_startup_existence_and_row_shape(production_remote, startup_kind):
+    env = production_remote
+    original = {}
+    path = env.persistent
+    if startup_kind in ('empty-table', 'null-row'):
+        original['SYSLOG_SERVER'] = {} if startup_kind == 'empty-table' else {DESTINATION: None}
+    if startup_kind != 'absent-file':
+        seed_persistent(env, original)
+    if startup_kind == 'symlink':
+        target = path.with_name('startup-target.json')
+        path.rename(target)
+        path.symlink_to(target.name)
+        path = target
+    expected = startup_evidence(path) if path.exists() else None
+    leaf_mtime = os.lstat(env.persistent).st_mtime_ns if startup_kind == 'symlink' else None
+    env.run('baseline')
+    with forwarding_owner(env).remote_syslog(DESTINATION):
+        path.write_text(json.dumps({'SYSLOG_SERVER': {DESTINATION: {'port': '514'}}}))
+    env.run('config')
+    env.run('persistent-restore')
+    assert (startup_evidence(path) if path.exists() else None) == expected
+    if startup_kind == 'symlink':
+        assert env.persistent.is_symlink()
+        assert os.lstat(env.persistent).st_mtime_ns == leaf_mtime
+    assert env.conn.data == {} and env.output == []
+
+
+@pytest.mark.parametrize('action', ['syslog-save', 'syslog-apply', 'syslog-restore'])
+def test_forwarding_unregistered_new_running_destination_fails_before_writes(production_remote, action):
+    env = production_remote
+    seed_forwarding(env)
+    env.run('baseline')
+    if action != 'syslog-save':
+        env.run('syslog-save', (DESTINATION, None))
+    if action == 'syslog-restore':
+        env.run('syslog-apply')
+    env.conn.data[b'SYSLOG_SERVER|192.0.2.99'] = {b'port': b'514'}
+    env.conn.writes.clear()
+    with pytest.raises(RuntimeError, match='syslog drift'):
+        env.run(action, (DESTINATION, None))
+    assert env.conn.writes == []
+
+
+def test_forwarding_actual_action_raw_verification_rejects_normalization(production_remote):
+    env = production_remote
+    seed_forwarding(env, {b'extra': b'None', b'NULL': b'NULL'})
+    original_decoded = env.decoded()
+    env.run('baseline')
+    env.run('syslog-save', (DESTINATION, None))
+    env.run('syslog-apply')
+    env.conn.corrupt = True
+    with pytest.raises(RuntimeError, match='syslog drift'):
+        env.run('syslog-restore')
+    assert env.decoded() == original_decoded
+    assert env.output == []
+
+
+@pytest.mark.parametrize('failure', ['before-execute', 'watch-conflict'])
+def test_forwarding_transaction_failure_never_commits_partial_row(production_remote, monkeypatch, failure):
+    env = production_remote
+    seed_forwarding(env, {b'port': b'6514', b'extra': b'None'})
+    env.run('baseline')
+    env.run('syslog-save', (DESTINATION, None))
+    pipeline = env.conn.pipeline
+
+    def transaction():
+        value = pipeline()
+        execute = value.execute
+
+        def fail():
+            if failure == 'watch-conflict':
+                env.conn.data[SYSLOG_KEY][b'unknown-writer'] = b'changed'
+                return execute()
+            raise RuntimeError('synthetic transaction failure')
+        value.execute = fail
+        return value
+    monkeypatch.setattr(env.conn, 'pipeline', transaction)
+    with pytest.raises(RuntimeError):
+        env.run('syslog-apply')
+    assert env.conn.writes == []
+    assert env.conn.data[SYSLOG_KEY][b'port'] == b'6514'
+
+
+def test_forwarding_controller_transmits_only_public_destination_not_raw_state():
+    ns = load()
+    host = Mock()
+    host.shell.return_value = {'rc': 0, 'stdout': '', 'stderr': ''}
+    remote = ns['RemoteState'](host, [])
+    remote.private_row = {'key': 'SYNTHETIC_OLD_SYSLOG_SECRET'}
+    remote.run('syslog-save', (DESTINATION, 'mgmt'))
+    command = host.shell.call_args.args[0]
+    assert DESTINATION in command and 'SYNTHETIC_OLD_SYSLOG_SECRET' not in command
+    assert command.endswith(' >/dev/null 2>&1')
+
+
+def test_forwarding_failed_registration_never_enters_mutation_or_cleanup(owner):
+    _, state, events = owner
+
+    def fail(action, spec=None):
+        events.append(action)
+        raise pytest.fail.Exception('registration refused')
+    state.dut_files.run.side_effect = fail
+    with pytest.raises(pytest.fail.Exception, match='registration refused'):
+        with state.remote_syslog(DESTINATION):
+            pytest.fail('must not enter')
+    assert events == ['syslog-save']
+
+
+def test_forwarding_body_and_cleanup_failures_remain_chained(owner):
+    _, state, _ = owner
+
+    def run(action, spec=None):
+        if action == 'syslog-restore':
+            raise RuntimeError('cleanup failed')
+    state.dut_files.run.side_effect = run
+    with pytest.raises(RuntimeError, match='cleanup failed') as failure:
+        with state.remote_syslog(DESTINATION):
+            pytest.fail('body failed')
+    assert isinstance(failure.value.__context__, pytest.fail.Exception)
+    assert 'body failed' in str(failure.value.__context__)
+
+
+@pytest.mark.parametrize('metadata', ['mode', 'mtime-only'])
+def test_forwarding_metadata_drift_is_not_blessed(production_remote, metadata):
+    env = production_remote
+    seed_forwarding(env)
+    env.run('baseline')
+    env.run('syslog-save', (DESTINATION, None))
+    env.run('syslog-apply')
+    env.run('syslog-restore')
+    if metadata == 'mode':
+        os.chmod(env.persistent, 0o600)
+    else:
+        os.utime(env.persistent, ns=(1234567891000000000, 1234567891000000000))
+    before = startup_evidence(env.persistent)
+    env.conn.writes.clear()
+    with pytest.raises(RuntimeError):
+        env.run('persistent-restore')
+    assert env.conn.writes == [] and startup_evidence(env.persistent) == before
+
+
+def test_forwarding_host_namespace_running_snapshot_not_multi_asic_wrapper(production_remote, monkeypatch):
+    env = production_remote
+    original = seed_forwarding(env, {b'port': b'6514', b'extra': b'None'}, {'port': '1514'})
+    expected = startup_evidence(env.persistent)
+    updater = sys.modules['generic_config_updater.generic_updater']
+    monkeypatch.setattr(updater, 'get_config_json', lambda: {'localhost': env.decoded(), 'asic0': {}})
+    env.run('baseline')
+    with forwarding_owner(env).remote_syslog(DESTINATION):
+        pass
+    # A writer persisting the restored host running row is still exact known
+    # destination ownership, not adoption of GCU's all-namespace wrapper.
+    original['SYSLOG_SERVER'][DESTINATION] = env.decoded()['SYSLOG_SERVER'][DESTINATION]
+    env.persistent.write_text(json.dumps(original))
+    env.run('config')
+    env.run('persistent-restore')
+    assert startup_evidence(env.persistent) == expected

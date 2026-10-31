@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 
 import logging
 import os
@@ -41,82 +41,88 @@ def del_syslog_server(dut, syslog_server_ip, module_ignore_errors=False):
 
 
 @contextmanager
-def capture_remote_syslog(dut, destination, vrf=None):
+def capture_remote_syslog(dut, destination, vrf=None, configuration=None):
     capture_file = "/tmp/syslog-{}.pcap".format(uuid.uuid4().hex)
     capture_pool = None
     capture_result = None
     server_added = False
 
-    try:
-        result = add_syslog_server(dut, destination, vrf=vrf)
-        pytest_assert(result["rc"] == 0, "Failed to add syslog server")
-        server_added = True
+    # Opt-in configuration owner encloses ALL capture cleanup, including failed
+    # pool close/join or pytest outcome exceptions. Legacy consumers are unchanged.
+    with ExitStack() as stack:
+        if configuration is not None:
+            stack.enter_context(configuration)
+        try:
+            if configuration is None:
+                result = add_syslog_server(dut, destination, vrf=vrf)
+                pytest_assert(result["rc"] == 0, "Failed to add syslog server")
+                server_added = True
 
-        remote_action = 'Target="{}" Port="514"'.format(destination)
+            remote_action = 'Target="{}" Port="514"'.format(destination)
 
-        def remote_action_configured():
-            command = "grep -F {} /etc/rsyslog.conf".format(
-                shlex.quote(remote_action)
-            )
-            if vrf:
-                command += " | grep -Fq {}".format(
-                    shlex.quote('Device="{}"'.format(vrf))
+            def remote_action_configured():
+                command = "grep -F {} /etc/rsyslog.conf".format(
+                    shlex.quote(remote_action)
                 )
-            else:
-                command += " >/dev/null"
-            return dut.shell(
-                command, module_ignore_errors=True
-            )["rc"] == 0
+                if vrf:
+                    command += " | grep -Fq {}".format(
+                        shlex.quote('Device="{}"'.format(vrf))
+                    )
+                else:
+                    command += " >/dev/null"
+                return dut.shell(
+                    command, module_ignore_errors=True
+                )["rc"] == 0
 
-        pytest_assert(
-            wait_until(30, 1, 0, remote_action_configured),
-            "Host rsyslog did not configure UDP/514 forwarding",
-        )
+            pytest_assert(
+                wait_until(30, 1, 0, remote_action_configured),
+                "Host rsyslog did not configure UDP/514 forwarding",
+            )
 
-        capture_command = (
-            "sudo timeout {} tcpdump -i any -y LINUX_SLL -nn "
-            "-s0 -U -w {} {}"
-        ).format(
-            SYSLOG_CAPTURE_SECONDS,
-            shlex.quote(capture_file),
-            shlex.quote(
-                "udp and dst host {} and dst port 514".format(destination)
-            ),
-        )
-        capture_pool, capture_result = dut.shell(
-            capture_command,
-            module_async=True,
-            module_ignore_errors=True,
-        )
-
-        def capture_started():
-            return dut.shell(
-                "sudo test $(stat -c %s {}) -ge 24".format(
-                    shlex.quote(capture_file)
+            capture_command = (
+                "sudo timeout {} tcpdump -i any -y LINUX_SLL -nn "
+                "-s0 -U -w {} {}"
+            ).format(
+                SYSLOG_CAPTURE_SECONDS,
+                shlex.quote(capture_file),
+                shlex.quote(
+                    "udp and dst host {} and dst port 514".format(destination)
                 ),
+            )
+            capture_pool, capture_result = dut.shell(
+                capture_command,
+                module_async=True,
                 module_ignore_errors=True,
-            )["rc"] == 0
+            )
 
-        pytest_assert(
-            wait_until(10, 1, 0, capture_started),
-            "UDP/514 packet capture did not start",
-        )
-        yield capture_result, capture_file
-    finally:
-        if capture_pool is not None:
-            if capture_result.ready():
-                capture_pool.close()
-            else:
-                capture_pool.terminate()
-            capture_pool.join()
-        dut.shell(
-            "sudo rm -f {}".format(shlex.quote(capture_file)),
-            module_ignore_errors=True,
-        )
-        if os.path.exists(capture_file):
-            os.remove(capture_file)
-        if server_added:
-            del_syslog_server(dut, destination, module_ignore_errors=True)
+            def capture_started():
+                return dut.shell(
+                    "sudo test $(stat -c %s {}) -ge 24".format(
+                        shlex.quote(capture_file)
+                    ),
+                    module_ignore_errors=True,
+                )["rc"] == 0
+
+            pytest_assert(
+                wait_until(10, 1, 0, capture_started),
+                "UDP/514 packet capture did not start",
+            )
+            yield capture_result, capture_file
+        finally:
+            if capture_pool is not None:
+                if capture_result.ready():
+                    capture_pool.close()
+                else:
+                    capture_pool.terminate()
+                capture_pool.join()
+            dut.shell(
+                "sudo rm -f {}".format(shlex.quote(capture_file)),
+                module_ignore_errors=True,
+            )
+            if os.path.exists(capture_file):
+                os.remove(capture_file)
+            if server_added:
+                del_syslog_server(dut, destination, module_ignore_errors=True)
 
 
 def read_syslog_payloads(dut, capture_result, capture_file):

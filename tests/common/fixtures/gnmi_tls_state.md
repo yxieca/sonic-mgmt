@@ -16,7 +16,8 @@ DEVICE_METADATA/localhost/cloudtype (running and persistent configuration) and
 the standard DUT/PTF certificate leaves.
 Full decoded configuration and raw owned hashes are compared independently;
 unrelated drift fails instead of being hidden by a broad rollback. Temporary
-syslog configuration remains owned by its existing context manager.
+syslog configuration uses the explicit exact-destination ownership integration
+described below; no other syslog row is owned.
 
 The public/general `gnmi_tls`, deprecated wrappers, reboot, rotation, 2038,
 benchmark, ZMQ and upgrade consumers retain the historical lifecycle. In
@@ -144,8 +145,10 @@ running CONFIG_DB and is captured before test mutation, privately on the DUT.
 It is NOT added to the certificate helper's full-file ownership list. Both case
 and outer restoration compare the current decoded startup configuration with
 that startup baseline after removing only `GNMI/gnmi`, `GNMI/certs`, all
-`GNMI_CLIENT_CERT` mappings, and `DEVICE_METADATA/localhost/cloudtype`. Extra
-GNMI rows, metadata fields and all other tables must remain equal. Duplicate JSON
+`GNMI_CLIENT_CERT` mappings, and `DEVICE_METADATA/localhost/cloudtype`, plus
+only the explicitly registered forwarding destination in its declared states
+when that opt-in context is used (see below). Extra GNMI/syslog rows, metadata
+fields and all other tables must remain equal. Duplicate JSON
 keys, invalid JSON, metadata drift and symlink changes fail closed **before any
 owned DB restoration**. No config-save, broad rollback or running-to-startup
 baseline substitution is used. A full save that propagates unrelated differences
@@ -190,3 +193,70 @@ The parent owns named full review, the staged synthetic root helper/real wrapper
 transport gate, then native VS correctness/failure testing and matched A*/B.
 A* must differ only in reuse lifetime; common same-image owner and per-case
 checks must match. No performance claim until valid native-restored pairs pass.
+
+## Forwarding destination ownership (AAA-only opt-in)
+
+The forwarding cases pass `NativeTlsState.remote_syslog(destination, vrf)` to
+`capture_remote_syslog(configuration=...)`. Other syslog consumers retain their
+existing CLI add/delete path; public/upgrade TLS fixtures are unchanged. The
+60-second capture, UDP/514 action/readiness checks, and exact remote/local audit
+record comparison are unchanged. Shared-role case save/restore/reuse ordering
+is unchanged; no forwarding actions run in a shared role case.
+
+At native admission, raw `SYSLOG_SERVER` hashes are saved privately alongside
+original running/persistent state. Before the first forwarding mutation, the
+owner validates the same image, exact persistent baseline and unchanged raw
+syslog table, then exclusively registers **one exact destination**. Registration
+cannot replace an earlier declaration or adopt a post-failure baseline. It
+records the raw original destination (including absence, `NULL`, literal `None`,
+empty strings and extra fields) independently of the startup destination.
+Neither original row nor any configuration payload is returned to the controller.
+
+The opt-in path does not use CLI add/delete: add rejects an existing destination,
+and delete would lose its original VRF/port/extra fields. Instead it atomically
+replaces only the registered raw Redis hash with explicit UDP port `514` and,
+when requested, VRF `mgmt`, using a watched redis-py transaction. It then invokes
+the CLI's `rsyslog-config` reload sequence, with output kept in the existing
+private log. This bypass is limited to the validated AAA destination/VRF; it is
+not a general replacement for syslog CLI validation. Original values never pass
+through CLI argv, SWSS set-entry logging, or a decoding/normalizing write API.
+
+The configuration context encloses capture cleanup. Its `finally` restores the
+original raw row even if apply/reload partially succeeds, capture fails, the
+body fails, or a pytest `BaseException` escapes. It runs before the enclosing
+native TLS finalizer and the function LogAnalyzer. A cleanup error remains an
+error; the outer owner must not relabel later recovery as native success.
+Changed-image actions refuse before Redis/service writes, while independent
+PTF/controller cleanup remains the native owner's responsibility.
+
+Persistent restoration still occurs only in the enclosing native owner, after
+stopping its gNMI writer. Its guard recognizes only the registered destination's
+explicit declared states: original startup row/absence, independently captured
+original decoded host/default-namespace running row/absence, or the exact
+temporary UDP/514 row. The host decoder is selected explicitly rather than
+assuming GCU's multi-ASIC namespace wrapper is a single CONFIG_DB. The
+running-original alternative covers a save after context cleanup; it is not
+proof of which service actually wrote the file. Additional destination fields,
+changed ports, unknown rows, unrelated tables and metadata drift still fail.
+Before outer configuration/persistent writes, raw syslog must again equal the
+immutable native original, including every other destination. The existing
+persistent atomic restore preserves original file existence, bytes/format and
+supported metadata (including mtime and supported symlinks); its concurrency
+recheck and post-start quiet-window verification remain enabled.
+
+Concurrency limits remain explicit: Redis WATCH protects the destination hash
+against a transaction-time conflicting writer. Whole-table raw pre/post checks
+reject unrelated drift; they are not a global lock over arbitrary external
+writers. File restoration similarly retains its pre-replace snapshot check and
+late-write detection, not a universal filesystem writer lock. Unsupported or
+concurrent drift fails and retains protected recovery evidence; no blind retry
+or baseline rebase occurs.
+
+Offline production-action and real-pytest scheduling regressions cover Get then
+Set, independent startup/running rows, sentinel/empty/absent states, unknown rows
+and fields, transaction/apply/body/capture/cleanup/image failures, exact native
+bytes/metadata, and finalizer-before-analyzer ordering. They use synthetic
+Redis/OS/service adapters, **not** a real Redis transaction, rsyslog reload,
+protected transport qualification or live endpoint/RPC restoration proof.
+Those remain testbed-owner gates on the exact frozen candidate. V4's real
+forwarding-Set native failure is retained, not reclassified as observer noise.
