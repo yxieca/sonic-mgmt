@@ -160,4 +160,9 @@ def gnmi_aaa_role_tls(request, duthosts, ptfhost, gnmi_aaa_tls_owner, gnmi_aaa_c
             logger.info("AAA TLS case setup: %.3fs", time.monotonic() - started)
             yield fixture
     finally:
-        logger.info("AAA TLS case lifecycle: %.3fs", time.monotonic() - started)
+        # Measurement-only A*: retain all per-case safeguards, but do not reuse
+        # the TLS environment across cases. The function log window is active.
+        try:
+            gnmi_aaa_tls_owner.close()
+        finally:
+            logger.info("AAA TLS case lifecycle: %.3fs", time.monotonic() - started)
