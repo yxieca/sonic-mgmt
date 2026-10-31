@@ -12,7 +12,8 @@ Generic sanity/config/core checks and test assertions are not disabled.
 
 This contract is for the AAA module's owned mutations only: GNMI server/cert
 hashes, the GNMI_CLIENT_CERT table (default-cert-auth deletes every mapping),
-DEVICE_METADATA/localhost/cloudtype and the standard DUT/PTF certificate leaves.
+DEVICE_METADATA/localhost/cloudtype (running and persistent configuration) and
+the standard DUT/PTF certificate leaves.
 Full decoded configuration and raw owned hashes are compared independently;
 unrelated drift fails instead of being hidden by a broad rollback. Temporary
 syslog configuration remains owned by its existing context manager.
@@ -135,6 +136,48 @@ after success; failure reports both nonsecret DUT and PTF recovery IDs when reta
 must inspect protected state privately and decide recovery/removal; it must not
 print `private.log`/JSON payloads into ordinary test logs. Admission failure also
 retains private diagnostics (explicit manual recovery/removal, no automatic TTL).
+
+## Persistent startup configuration
+
+The immutable native-entry `/etc/sonic/config_db.json` snapshot is independent of
+running CONFIG_DB and is captured before test mutation, privately on the DUT.
+It is NOT added to the certificate helper's full-file ownership list. Both case
+and outer restoration compare the current decoded startup configuration with
+that startup baseline after removing only `GNMI/gnmi`, `GNMI/certs`, all
+`GNMI_CLIENT_CERT` mappings, and `DEVICE_METADATA/localhost/cloudtype`. Extra
+GNMI rows, metadata fields and all other tables must remain equal. Duplicate JSON
+keys, invalid JSON, metadata drift and symlink changes fail closed **before any
+owned DB restoration**. No config-save, broad rollback or running-to-startup
+baseline substitution is used. A full save that propagates unrelated differences
+between preexisting running/startup configurations is deliberately rejected:
+those differences are not owned by this fixture.
+
+Formatting/timestamp-only changes without an owned semantic delta are rejected
+as unexplained drift. Only after that semantic-drift gate may original startup bytes be restored,
+including original whitespace/key order, supported metadata and absence. The
+existing metadata preflight rejects unsupported xattrs/ACLs/flags/hardlinks.
+A single symlink to a regular file (or absent target) is supported: its text and
+metadata remain unchanged; the target is snapshotted/restored. Chained symlinks,
+symlink ancestors and other unsupported types fail admission. Regular contents
+are staged with mode0600 on the target filesystem, assigned original metadata,
+fsynced, rechecked for concurrent drift, then atomically replaced and the parent
+directory fsynced. Original private recovery is retained on every failure. This
+is not an adversarial transaction against concurrent root writers.
+
+Shared case cleanup now stops the native service before raw role/cloudtype
+restoration, stops it again after DB notifications, restores startup bytes, and
+starts it with the unchanged shared TLS configuration/certificates. A bounded
+60s PID-owned50052 listener check and existing critical-process check precede
+case verification; subsequent test RPCs retain their authentication assertions.
+This adds a per-case service stop/start, but does not regenerate certificates.
+Performance must be remeasured; old timing is not evidence for this revision.
+Outer cleanup restores startup after the second stop and before original-service
+startup. After readiness/health, both lifetimes observe exact persistent state
+for two seconds at100ms polling cadence, failing immediately on a late write,
+never repairing it repeatedly. Next shared admission checks again. This is a
+bounded observation window, not a proof that no later asynchronous writer can
+exist; live qualification must check native-entry independently before generic
+cleanup. The exact lower-level writer in the v3 failure remains uninstrumented.
 
 ## Required qualification
 

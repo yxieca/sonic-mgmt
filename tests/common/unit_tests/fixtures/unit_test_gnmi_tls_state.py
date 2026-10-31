@@ -56,12 +56,14 @@ def owner(tmp_path):
 def test_restoration_order_inside_common_owner(owner):
     _, state, events = owner
     state.restore()
-    assert events == ['dut:image', 'dut:stop', 'dut:config', 'dut:stop', 'dut:restore', 'ptf:restore',
-                      'dut:start', 'ready', 'health', 'dut:image', 'ptf:discard', 'dut:discard']
+    assert events == ['dut:image', 'dut:persistent-check', 'dut:stop', 'dut:config', 'dut:stop',
+                      'dut:persistent-restore', 'dut:restore', 'ptf:restore', 'dut:start', 'ready', 'health',
+                      'dut:persistent-verify', 'dut:image', 'ptf:discard', 'dut:discard']
     assert not Path(state.cert_dir).exists()
 
 
-@pytest.mark.parametrize('operation', ['image', 'stop', 'config', 'restore', 'start', 'ready', 'health', 'close'])
+@pytest.mark.parametrize('operation', ['image', 'stop', 'config', 'restore', 'start', 'ready', 'health', 'close',
+                                       'persistent-check', 'persistent-restore', 'persistent-verify'])
 @pytest.mark.parametrize('exception', [ValueError, pytest.fail.Exception])
 def test_failure_visible_independent_cleanup_recovery_retained(owner, operation, exception):
     ns, state, events = owner
@@ -273,11 +275,12 @@ def production_remote(tmp_path, monkeypatch):
     ns = load()
     root = tmp_path / 'recovery'
     root.mkdir(mode=0o700)
+    persistent = tmp_path / 'config_db.json'
     conn = RawRedis()
     env = SimpleNamespace(root=root, conn=conn, image='A', argv=[
         '/usr/sbin/telemetry', '--port', '8080', '--noTLS', '--bind_address', '127.0.0.1'],
         listeners='LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:(("telemetry",pid=42,fd=8))',
-        output=[], commands=[], wire=b'public-capabilities', grpc_calls=[])
+        output=[], commands=[], wire=b'public-capabilities', grpc_calls=[], persistent=persistent)
     original_open = builtins.open
     original_lstat = os.lstat
     original_listdir = os.listdir
@@ -368,6 +371,12 @@ def production_remote(tmp_path, monkeypatch):
     monkeypatch.setattr(os, 'close', lambda fd: None if fd in (998, 999) else original_close(fd))
     monkeypatch.setattr(os, 'write', lambda fd, value: env.output.append((fd, value)))
     monkeypatch.setattr('subprocess.check_output', command)
+    # Keep production action bodies intact; relocate ONLY the fixed DUT path.
+    source = inspect.getsource(ns['_remote']).replace("'/etc/sonic/config_db.json'", repr(str(persistent)))
+    exec(compile(source, str(SOURCE), 'exec'), ns)
+    monkeypatch.setattr('fcntl.ioctl', lambda *args: None)  # Linux metadata capability modeled on macOS.
+    monkeypatch.setattr(os, 'listxattr', lambda *args, **kwargs: [], raising=False)
+    monkeypatch.setattr(os, 'fchown', lambda *args: None)  # Fixture files already belong to this uid/gid.
     env.run = lambda action: ns['_remote'](str(root), action, [])
     env.decoded = decoded
     env.ns = ns
@@ -523,3 +532,254 @@ def test_controller_missing_decoder_fails_closed(monkeypatch):
     monkeypatch.setitem(sys.modules, 'pygnmi', None)
     with pytest.raises(RuntimeError, match='unavailable controller decoder'):
         load()['_decode_capabilities']('GNMI_CAPABILITIES_V1:' + base64.b64encode(b'public-wire').decode())
+
+
+def seed_persistent(env, value):
+    env.persistent.write_text(json.dumps(value, indent=3) + '\n\n')
+    os.chmod(env.persistent, 0o640)
+    os.utime(env.persistent, ns=(1234567890000000000, 1234567890000000000))
+
+
+def persistent_identity(path):
+    info = path.stat()
+    return path.read_bytes(), info.st_mode, info.st_uid, info.st_gid, info.st_mtime_ns
+
+
+@pytest.mark.parametrize('existing', [False, True])
+@pytest.mark.parametrize('cloud', [None, '', 'None', 'NULL', 'Private'])
+def test_production_persistent_owned_deltas_preserve_independent_baselines(production_remote, existing, cloud):
+    env = production_remote
+    startup = {'DEVICE_METADATA': {'localhost': {'type': 'ToR'}}, 'FEATURE': {'x': {'state': 'enabled'}}}
+    if cloud is not None:
+        startup['DEVICE_METADATA']['localhost']['cloudtype'] = cloud
+    if existing:
+        startup.update(GNMI={'gnmi': {'port': '8080', 'empty': '', 'NULL': 'None'},
+                             'certs': {'server_key': '/old/key'}, 'unowned-row': {'keep': 'NULL'}},
+                       GNMI_CLIENT_CERT={'other': {'role': ['readonly'], 'NULL': 'None', 'empty': ''},
+                                         'test.client.gnmi.sonic': {'role': ['readwrite'], 'extra': 'NULL'}})
+    seed_persistent(env, startup)
+    expected = persistent_identity(env.persistent)
+    # Running is intentionally NOT the startup snapshot, including owned state.
+    env.conn.data = {b'GNMI|gnmi': {b'port': b'50052'},
+                     b'GNMI_CLIENT_CERT|test.client.gnmi.sonic': {b'role@': b'readonly', b'NULL': b'None'}}
+    env.run('baseline')
+    env.run('case-save')
+    running = deepcopy(env.conn.data)
+    for role in ('admin', '', 'None'):
+        persisted = deepcopy(startup)
+        persisted.setdefault('GNMI', {})['gnmi'] = {'port': '50052', 'user_auth': 'true'}
+        persisted['GNMI']['certs'] = {'server_key': '/test/key'}
+        persisted['GNMI_CLIENT_CERT'] = {'test.client.gnmi.sonic': {'role': [role]}}
+        persisted['DEVICE_METADATA']['localhost']['cloudtype'] = 'Public'
+        env.persistent.write_text(json.dumps(persisted))
+        env.conn.data[b'GNMI_CLIENT_CERT|test.client.gnmi.sonic'] = {b'role@': role.encode()}
+        env.conn.data[b'DEVICE_METADATA|localhost'] = {b'cloudtype': b'Public'}
+        env.run('case-restore')
+        env.run('persistent-restore')
+        env.run('case-verify')
+        assert persistent_identity(env.persistent) == expected
+        assert {k: v for k, v in env.conn.data.items() if v} == running
+    env.run('config')
+    env.run('persistent-restore')
+    assert persistent_identity(env.persistent) == expected
+    assert env.output == []
+
+
+@pytest.mark.parametrize('drift', ['feature', 'gnmi-row', 'metadata-field', 'metadata-mode', 'malformed', 'duplicate'])
+@pytest.mark.parametrize('action', ['config', 'case-restore', 'persistent-restore'])
+def test_production_persistent_unrelated_drift_precedes_any_owned_restore(production_remote, drift, action):
+    env = production_remote
+    baseline = {'FEATURE': {'x': {'state': 'enabled'}}, 'DEVICE_METADATA': {'localhost': {'type': 'ToR'}}}
+    seed_persistent(env, baseline)
+    env.conn.data = {b'GNMI_CLIENT_CERT|test.client.gnmi.sonic': {b'role@': b'readonly'}}
+    env.run('baseline')
+    env.run('case-save')
+    changed = deepcopy(baseline)
+    changed['GNMI'] = {'gnmi': {'port': '50052'}}
+    if drift == 'feature':
+        changed['FEATURE']['x']['state'] = 'disabled'
+    elif drift == 'gnmi-row':
+        changed['GNMI']['unowned'] = {'extra': 'bad'}
+    elif drift == 'metadata-field':
+        changed['DEVICE_METADATA']['localhost']['type'] = 'Spine'
+    env.persistent.write_text(json.dumps(changed))
+    if drift == 'metadata-mode':
+        os.chmod(env.persistent, 0o600)
+    elif drift == 'malformed':
+        env.persistent.write_text('{bad')
+    elif drift == 'duplicate':
+        env.persistent.write_text('{"FEATURE": {}, "FEATURE": {}}')
+    before = persistent_identity(env.persistent)
+    with pytest.raises((RuntimeError, ValueError)):
+        env.run(action)
+    assert env.conn.writes == []
+    assert persistent_identity(env.persistent) == before
+    assert env.output == []
+
+
+@pytest.mark.parametrize('symlink', [False, True])
+@pytest.mark.parametrize('absent', [False, True])
+def test_production_persistent_absence_and_symlink_contract(production_remote, symlink, absent):
+    env = production_remote
+    path = env.persistent
+    if symlink:
+        target = path.with_name('startup.json')
+        path.symlink_to(target.name)
+        path = target
+    if not absent:
+        path.write_text(' { "GNMI" : {} }\n')
+    env.run('baseline')
+    expected = path.read_bytes() if path.exists() else None
+    link_before = os.lstat(env.persistent) if symlink else None
+    path.write_text('{"GNMI":{"gnmi":{"port":"50052"}}, "GNMI_CLIENT_CERT":{}}')
+    env.run('persistent-restore')
+    assert (path.read_bytes() if path.exists() else None) == expected
+    if symlink:
+        assert env.persistent.is_symlink() and os.readlink(env.persistent) == path.name
+        assert os.lstat(env.persistent).st_mtime_ns == link_before.st_mtime_ns
+
+
+@pytest.mark.parametrize('action', ['persistent-check', 'persistent-restore', 'persistent-verify'])
+def test_production_persistent_image_guard_zero_writes(production_remote, monkeypatch, action):
+    env = production_remote
+    seed_persistent(env, {})
+    env.run('baseline')
+    env.persistent.write_text('{"GNMI":{"gnmi":{"port":"50052"}}}')
+    expected = persistent_identity(env.persistent)
+    env.image = 'replacement'
+    replace = Mock(side_effect=AssertionError('must not write'))
+    monkeypatch.setattr(os, 'replace', replace)
+    with pytest.raises(RuntimeError, match='image changed'):
+        env.run(action)
+    assert not replace.called and env.conn.writes == []
+    assert persistent_identity(env.persistent) == expected
+
+
+@pytest.mark.parametrize('failure', ['write', 'read', 'atomic', 'fsync', 'racing-writer'])
+def test_production_persistent_io_failure_retains_original_recovery(production_remote, monkeypatch, failure):
+    env = production_remote
+    seed_persistent(env, {})
+    env.run('baseline')
+    env.persistent.write_text('{"GNMI":{"gnmi":{"port":"50052"}}}')
+    expected = persistent_identity(env.persistent)
+    if failure == 'write':
+        monkeypatch.setattr(tempfile, 'mkstemp', Mock(side_effect=OSError('synthetic write failure')))
+    elif failure == 'read':
+        opened = os.open
+
+        def fail_read(path, *args, **kwargs):
+            if str(path) == str(env.persistent):
+                raise OSError('synthetic read failure')
+            return opened(path, *args, **kwargs)
+        monkeypatch.setattr(os, 'open', fail_read)
+    elif failure == 'atomic':
+        monkeypatch.setattr(os, 'replace', Mock(side_effect=OSError('synthetic atomic failure')))
+    elif failure == 'fsync':
+        monkeypatch.setattr(os, 'fsync', Mock(side_effect=OSError('synthetic fsync failure')))
+    else:
+        fsync = os.fsync
+
+        def race(fd):
+            env.persistent.write_text('{"UNRELATED":{"new":"writer"}}')
+            return fsync(fd)
+        monkeypatch.setattr(os, 'fsync', race)
+    with pytest.raises((RuntimeError, OSError)):
+        env.run('persistent-restore')
+    if failure != 'racing-writer':
+        assert persistent_identity(env.persistent) == expected
+    else:
+        assert json.loads(env.persistent.read_text()) == {'UNRELATED': {'new': 'writer'}}
+    assert (env.root / 'persistent.json').exists()
+    assert not list(env.persistent.parent.glob('.gnmi-restore-*'))
+    assert env.output == []
+
+
+def test_production_late_write_is_detected_never_repaired(production_remote, monkeypatch):
+    env = production_remote
+    seed_persistent(env, {})
+    env.run('baseline')
+    import threading
+
+    def write_late(*args):
+        env.persistent.write_text('{"GNMI":{"gnmi":{"port":"50052"}}}')
+    monkeypatch.setattr(threading.Event, 'wait', write_late)
+    with pytest.raises(RuntimeError, match='late write'):
+        env.run('persistent-verify')
+    assert json.loads(env.persistent.read_text())['GNMI']['gnmi']['port'] == '50052'
+    assert (env.root / 'persistent.json').exists()
+
+
+def test_shared_case_stops_writer_and_verifies_after_restart(owner):
+    _, state, events = owner
+    state.case_restore()
+    assert events == ['dut:persistent-check', 'dut:stop', 'dut:case-restore', 'dut:stop',
+                      'dut:persistent-restore', 'dut:start', 'dut:shared-ready', 'health',
+                      'dut:case-verify', 'dut:persistent-verify']
+
+
+@pytest.mark.parametrize('bad', ['symlink-replaced', 'hardlink', 'xattr', 'directory', 'deleted'])
+def test_production_persistent_unsupported_or_replaced_state_refused(production_remote, monkeypatch, bad):
+    env = production_remote
+    seed_persistent(env, {})
+    if bad == 'symlink-replaced':
+        target = env.persistent.with_name('target.json')
+        env.persistent.rename(target)
+        env.persistent.symlink_to(target.name)
+    env.run('baseline')
+    if bad == 'symlink-replaced':
+        env.persistent.unlink()
+        env.persistent.write_text('{}')
+    elif bad == 'hardlink':
+        os.link(env.persistent, env.persistent.with_name('hardlink.json'))
+    elif bad == 'xattr':
+        monkeypatch.setattr(os, 'listxattr', lambda *args, **kwargs: ['user.synthetic'])
+    elif bad == 'directory':
+        env.persistent.unlink()
+        env.persistent.mkdir()
+    else:
+        env.persistent.unlink()
+    with pytest.raises(RuntimeError):
+        env.run('persistent-restore')
+    assert env.conn.writes == [] and env.output == []
+
+
+@pytest.mark.parametrize('operation', ['persistent-check', 'stop', 'case-restore', 'persistent-restore',
+                                       'start', 'shared-ready', 'case-verify', 'persistent-verify'])
+def test_shared_case_failure_propagates_without_successful_reuse(owner, operation):
+    _, state, events = owner
+
+    def run(op):
+        events.append('dut:' + op)
+        if op == operation:
+            raise RuntimeError('synthetic')
+    state.dut_files.run.side_effect = run
+    with pytest.raises(RuntimeError):
+        state.case_restore()
+    assert 'dut:discard' not in events
+    if operation in ('persistent-check', 'stop', 'case-restore', 'persistent-restore'):
+        assert 'dut:start' not in events
+
+
+def test_production_shared_readiness_uses_native_pid(production_remote):
+    env = production_remote
+    env.run('baseline')
+    env.listeners = 'LISTEN 0 128 *:50052 *:* users:(("unrelated",pid=999,fd=8))'
+    with pytest.raises(RuntimeError, match='not ready'):
+        env.run('shared-ready')
+    env.listeners = 'LISTEN 0 128 *:50052 *:* users:(("telemetry",pid=42,fd=8))'
+    env.run('shared-ready')
+
+
+@pytest.mark.parametrize('format_only', [True, False])
+def test_production_no_owned_semantic_delta_does_not_hide_file_drift(production_remote, format_only):
+    env = production_remote
+    seed_persistent(env, {'FEATURE': {}})
+    env.run('baseline')
+    if format_only:
+        env.persistent.write_text('{"FEATURE":{}}')
+    else:
+        os.utime(env.persistent, ns=(1234567891000000000, 1234567891000000000))
+    expected = persistent_identity(env.persistent)
+    with pytest.raises(RuntimeError, match='unexplained persistent'):
+        env.run('persistent-restore')
+    assert persistent_identity(env.persistent) == expected

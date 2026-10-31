@@ -30,6 +30,8 @@ def _remote(root, action, paths):
     import stat
     import subprocess
     import sys
+    import tempfile
+    from copy import deepcopy
 
     # Only the public Capabilities action retains a separate output descriptor.
     # All imports, diagnostics and private operations still use private.log.
@@ -110,6 +112,142 @@ def _remote(root, action, paths):
         else:
             raise RuntimeError('unsupported file type')
         return item
+
+    persistent_path = '/etc/sonic/config_db.json'
+
+    def persistent_snapshot():
+        leaf = snapshot(persistent_path)
+        target = None
+        if leaf and leaf['kind'] == 'link':
+            target = os.path.normpath(os.path.join(os.path.dirname(persistent_path), leaf['target']))
+            if target == persistent_path:
+                raise RuntimeError('persistent symlink cycle')
+            content = snapshot(target)
+        else:
+            content = leaf
+        if content and content['kind'] != 'file':
+            raise RuntimeError('unsupported persistent configuration type')
+        return dict(leaf=leaf, target=target, content=content)
+
+    def persistent_json(saved):
+        # Reject ambiguous JSON rather than letting duplicate keys conceal drift.
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise RuntimeError('duplicate persistent configuration key')
+                result[key] = value
+            return result
+        content = saved['content']
+        value = (json.loads(base64.b64decode(content['data']), object_pairs_hook=unique)
+                 if content else {})
+        if not isinstance(value, dict):
+            raise RuntimeError('invalid persistent configuration')
+        return value
+
+    def unowned(value):
+        value = deepcopy(value)
+        # Own two GNMI rows, NOT arbitrary rows in that table. All principal
+        # rows are owned because default-cert-auth removes all mappings.
+        for table, rows in (('GNMI', ('gnmi', 'certs')), ('DEVICE_METADATA', ('localhost',))):
+            if table not in value:
+                continue
+            if not isinstance(value[table], dict):
+                raise RuntimeError('invalid persistent table')
+            for row in rows:
+                if table == 'GNMI':
+                    value[table].pop(row, None)
+                elif row in value[table]:
+                    if not isinstance(value[table][row], dict):
+                        raise RuntimeError('invalid persistent metadata')
+                    value[table][row].pop('cloudtype', None)
+                    if not value[table][row]:
+                        del value[table][row]
+            if not value[table]:
+                # Empty scaffolding is equivalent only for an owned-only
+                # table/row; unrelated rows/fields above are never removed.
+                del value[table]
+        value.pop('GNMI_CLIENT_CERT', None)
+        return value
+
+    def persistent_check(exact=False):
+        saved = load('persistent.json')
+        current = persistent_snapshot()
+        # The startup and running baselines are independent: a Set may save the
+        # entire running DB. Only OUR fields may differ from STARTUP, however.
+        if unowned(persistent_json(current)) != unowned(persistent_json(saved)):
+            raise RuntimeError('unrelated persistent configuration drift')
+        if saved['target'] != current['target'] or (saved['target'] and saved['leaf'] != current['leaf']):
+            raise RuntimeError('persistent symlink drift')
+        old, now = saved['content'], current['content']
+        if old and not now:
+            raise RuntimeError('persistent configuration disappeared')
+        if old and any(old[k] != now[k] for k in ('kind', 'uid', 'gid', 'mode')):
+            raise RuntimeError('persistent metadata drift')
+        if exact and current != saved:
+            raise RuntimeError('persistent configuration not restored or late write')
+        return saved, current
+
+    def shared_ready():
+        processes, sockets = runtime()
+        return (len(processes) == 1 and
+                any(processes[0][0] in pids and address.rsplit(':', 1)[-1] == '50052'
+                    for address, pids in sockets))
+
+    def persistent_watch():
+        # Observe, NEVER repair, late writes over a bounded quiet window. The
+        # event wait is polling cadence, not a sleep offered as writer proof.
+        import threading
+        import time
+        deadline = time.monotonic() + 2
+        wake = threading.Event()
+        while True:
+            persistent_check(exact=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wake.wait(min(0.1, remaining))
+
+    def persistent_restore():
+        same_image()  # In the actual action, before ANY persistent write.
+        saved, current = persistent_check()
+        if saved == current:
+            return
+        # A metadata/format-only edit is not evidence of an owned Set. Do not
+        # hide it by rewriting the original just because semantics compare equal.
+        if persistent_json(saved) == persistent_json(current):
+            raise RuntimeError('unexplained persistent bytes or timestamp drift')
+        path = saved['target'] or persistent_path
+        original = saved['content']
+        if original is None:
+            # Absence is owned only after checking every newly persisted field.
+            if persistent_snapshot() != current:
+                raise RuntimeError('concurrent persistent configuration write')
+            os.unlink(path)
+        else:
+            # Never truncate the live file. Stage privately on the same fs,
+            # restore supported metadata, recheck, and atomically replace it.
+            fd, staged = tempfile.mkstemp(prefix='.gnmi-restore-', dir=os.path.dirname(path))
+            try:
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(base64.b64decode(original['data']))
+                    stream.flush()
+                    os.fchown(stream.fileno(), original['uid'], original['gid'])
+                    os.fchmod(stream.fileno(), original['mode'])
+                    os.utime(stream.fileno(), ns=(original['mtime'], original['mtime']))
+                    os.fsync(stream.fileno())
+                if persistent_snapshot() != current:
+                    raise RuntimeError('concurrent persistent configuration write')
+                os.replace(staged, path)
+            finally:
+                if os.path.lexists(staged):
+                    os.unlink(staged)
+        directory = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        persistent_check(exact=True)
 
     def image():
         # Never use cached duthost facts. Detect OS, boot/rootfs and service image
@@ -244,6 +382,21 @@ def _remote(root, action, paths):
         save('endpoint.json', endpoint())
         save('config.json', config())
         save('raw.json', raw(db()))
+        saved = persistent_snapshot()
+        persistent_json(saved)  # Admission validates JSON before test mutation.
+        save('persistent.json', saved)
+    elif action == 'persistent-check':
+        same_image()
+        persistent_check()
+    elif action == 'persistent-restore':
+        persistent_restore()
+    elif action == 'persistent-verify':
+        same_image()
+        persistent_watch()
+    elif action == 'shared-ready':
+        same_image()
+        if not shared_ready():
+            raise RuntimeError('shared TLS listener not ready')
     elif action == 'capabilities':
         capabilities()
     elif action == 'image':
@@ -266,6 +419,7 @@ def _remote(root, action, paths):
                 os.unlink(path)
     elif action == 'case-save':
         same_image()
+        persistent_check(exact=True)
         save('case-config.json', config())
         mapping = raw(db())
         if not mapping['hashes'][pack(keys[2].encode())].get(pack(b'role@')):
@@ -273,10 +427,12 @@ def _remote(root, action, paths):
         save('case-raw.json', mapping)
     elif action == 'case-verify':
         same_image()  # Shared admission, before the next test can mutate.
+        persistent_check(exact=True)
         if config() != load('case-config.json') or raw(db()) != load('case-raw.json'):
             raise RuntimeError('unrelated AAA case configuration drift')
     elif action == 'case-restore':
         same_image()  # MUST precede every DB write, including finally cleanup.
+        persistent_check()  # Refuse unrelated startup drift BEFORE owned DB writes.
         conn = db()
         saved = load('case-raw.json')
         try:
@@ -287,6 +443,7 @@ def _remote(root, action, paths):
             raise RuntimeError('case restoration mismatch')
     elif action == 'config':
         same_image()
+        persistent_check()  # Refuse unrelated startup drift before owned restoration.
         # Only owned raw hashes/cloudtype; no GCU patch-value syslog logging.
         conn = db()
         failures = []
@@ -438,7 +595,27 @@ class NativeTlsState:
         self.dut_files.run('case-verify')
 
     def case_restore(self):
+        # Stop the Set writer before repairing either DB. Preserve the shared
+        # TLS files; a stopped supervisor program will not autorestart on its
+        # own. Config notifications can restart it, hence the second stop.
+        self.dut_files.run('persistent-check')
+        self.dut_files.run('stop')
         self.dut_files.run('case-restore')
+        self.dut_files.run('stop')
+        self.dut_files.run('persistent-restore')
+        self.dut_files.run('start')
+
+        def ready():
+            try:
+                self.dut_files.run('shared-ready')
+                return True
+            except RuntimeError:
+                return False
+        if not wait_until(60, 2, 0, ready):
+            raise RuntimeError('Shared TLS listener not restored within 60s')
+        wait_critical_processes(self.dut)
+        self.dut_files.run('case-verify')
+        self.dut_files.run('persistent-verify')
 
     def prepare(self):
         self.dut_files.run('image')
@@ -471,19 +648,24 @@ class NativeTlsState:
             attempt('client close', client.close)
         same = not self.prepared or attempt('image changed/unavailable', lambda: self.dut_files.run('image'))
         if self.prepared and same:
+            persistent_ok = attempt('persistent drift', lambda: self.dut_files.run('persistent-check'))
             stopped = attempt('stop', lambda: self.dut_files.run('stop'))
-            config_ok = attempt('configuration', lambda: self.dut_files.run('config')) if stopped else False
+            config_ok = (attempt('configuration', lambda: self.dut_files.run('config'))
+                         if stopped and persistent_ok else False)
             # Configuration notifications may restart the watcher. Stop again
             # even after a config failure, before changing any watched file.
             stopped = attempt('stop after config', lambda: self.dut_files.run('stop'))
+            persistent_ok = (attempt('persistent configuration', lambda: self.dut_files.run('persistent-restore'))
+                             if stopped and config_ok else False)
             files_ok = attempt('DUT files', lambda: self.dut_files.run('restore')) if stopped else False
             if not stopped:
                 errors.append('DUT files retained: watcher not stopped')
             attempt('PTF files', lambda: self.ptf_files.run('restore'))
-            if stopped and config_ok and files_ok:
+            if stopped and config_ok and persistent_ok and files_ok:
                 if attempt('start', lambda: self.dut_files.run('start')):
                     attempt('original endpoint/semantic readiness', self.wait_ready)
                 attempt('critical processes', lambda: wait_critical_processes(self.dut))
+            attempt('persistent exit verification', lambda: self.dut_files.run('persistent-verify'))
             attempt('exit image', lambda: self.dut_files.run('image'))
         elif self.prepared:
             # No old config/file writes or service stop on a changed image.
