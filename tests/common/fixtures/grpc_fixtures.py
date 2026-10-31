@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Optional
 from tests.common.cert_utils import create_gnmi_cert_generator
 from tests.common.grpc_config import grpc_config
+from tests.common.fixtures.gnmi_tls_state import NativeTlsState
 from tests.common.gu_utils import create_checkpoint, rollback
 from tests.common.platform.processes_utils import wait_critical_processes
 from tests.common.helpers.gnmi_utils import GNMIEnvironment
@@ -171,6 +172,7 @@ class GnmiFixture:
     _duthost: object = None  # Fixture-selected DUT (post-reboot reconfig, DB cross-checks)
     _ptfhost: object = None  # For post-upgrade cert redistribution
     _cert_dir: Optional[str] = None  # Local cert dir used during setup
+    _same_image_state: object = None  # Private remote case-state owner (AAA opt-in)
 
     @property
     def duthost(self):
@@ -265,8 +267,28 @@ def gnmi_tls(request, duthosts, ptfhost):
     yield from _gnmi_tls_flow(duthost, ptfhost)
 
 
+@pytest.fixture(scope="module")
+def gnmi_original_service_verifier():
+    """Override with a secret-safe fresh bounded verifier for secure baselines.
+
+    See gnmi_tls_state.md. None supports only observed unauthenticated plaintext.
+    """
+    return None
+
+
+@pytest.fixture
+def gnmi_same_image_tls(request, duthosts, ptfhost, gnmi_original_service_verifier, loganalyzer):
+    """Opt-in native restoration; explicitly dependent on the live log window."""
+    yield from _gnmi_same_image_tls_flow(
+        _get_target_duthost(duthosts, request), ptfhost, verifier=gnmi_original_service_verifier)
+
+
 def _gnmi_tls_flow(duthost, ptfhost, strict_cleanup=False):
-    """Managed TLS lifecycle; strict cleanup is opt-in for shared owners."""
+    """Historical/general contract, including image-changing upgrade callers.
+
+    This is deliberately NOT the same-image restoration guarantee. Upgrade
+    migration remains unchanged; no runtime-failure fallback selects this flow.
+    """
     checkpoint_name = "gnoi_tls_setup"
     cert_dir = "/tmp/gnoi_certs"
 
@@ -282,51 +304,8 @@ def _gnmi_tls_flow(duthost, ptfhost, strict_cleanup=False):
             duthost, ptfhost=ptfhost, cert_dir=cert_dir, regen_certs=True, verify=True
         )
 
-        # Build coupled client with the exact config we just set up
-        host = duthost.mgmt_ip
-        port = grpc_config.DEFAULT_TLS_PORT
-        target = f"[{host}]:{port}"
-
-        ptf_cert_paths = grpc_config.get_ptf_cert_paths()
-        cert_paths = CertPaths(
-            ca_cert=ptf_cert_paths['ca_cert'],
-            client_cert=ptf_cert_paths['client_cert'],
-            client_key=ptf_cert_paths['client_key'],
-        )
-
-        client = PtfGrpc(ptfhost, target, plaintext=False)
-        client.configure_tls_certificates(
-            ca_cert=cert_paths.ca_cert,
-            client_cert=cert_paths.client_cert,
-            client_key=cert_paths.client_key,
-        )
-        gnoi_client = PtfGnoi(client)
-
-        # PygnmiClient runs in the sonic-mgmt orchestrator and reads the locally
-        # generated certs in cert_dir (not the PTF-side copies).
-        pygnmi_client = PygnmiClient(
-            host, port, plaintext=False,
-            ca_cert=f"{cert_dir}/{grpc_config.CA_CERT}",
-            client_cert=f"{cert_dir}/{grpc_config.CLIENT_CERT}",
-            client_key=f"{cert_dir}/{grpc_config.CLIENT_KEY}",
-        )
-
-        fixture = GnmiFixture(
-            host=host,
-            port=port,
-            tls=True,
-            cert_paths=cert_paths,
-            grpc=client,
-            gnoi=gnoi_client,
-            pygnmi_client=pygnmi_client,
-            transport='tls',
-            _duthost=duthost,
-            _ptfhost=ptfhost,
-            _cert_dir=cert_dir,
-        )
-
-        logger.info("Constructed PygnmiClient: %s", pygnmi_client)
-        logger.info("gNOI TLS server setup completed successfully")
+        fixture = _tls_client_fixture(duthost, ptfhost, cert_dir)
+        pygnmi_client = fixture.pygnmi_client
         yield fixture
 
     finally:
@@ -376,6 +355,76 @@ def _gnmi_tls_flow(duthost, ptfhost, strict_cleanup=False):
 
         if strict_cleanup and cleanup_errors:
             raise RuntimeError("gNMI TLS cleanup failed: {}".format("; ".join(cleanup_errors)))
+
+
+def _gnmi_same_image_tls_flow(duthost, ptfhost, verifier=None):
+    """Explicit same-image contract, shared by fresh and reused AAA cases."""
+    state = NativeTlsState(duthost, ptfhost, verifier=verifier)
+    cert_dir = state.cert_dir
+    pygnmi_client = None
+    try:
+        state.prepare()
+        # 2-5. Generate/distribute certs, configure + restart server, verify handshake
+        _establish_gnoi_tls_handshake(
+            duthost, ptfhost=ptfhost, cert_dir=cert_dir, regen_certs=True, verify=True
+        )
+
+        fixture = _tls_client_fixture(duthost, ptfhost, cert_dir)
+        fixture._same_image_state = state
+        pygnmi_client = fixture.pygnmi_client
+        yield fixture
+
+    finally:
+        state.restore(pygnmi_client)
+
+
+def _tls_client_fixture(duthost, ptfhost, cert_dir):
+    # Build coupled client with the exact config we just set up
+    host = duthost.mgmt_ip
+    port = grpc_config.DEFAULT_TLS_PORT
+    target = f"[{host}]:{port}"
+
+    ptf_cert_paths = grpc_config.get_ptf_cert_paths()
+    cert_paths = CertPaths(
+        ca_cert=ptf_cert_paths['ca_cert'],
+        client_cert=ptf_cert_paths['client_cert'],
+        client_key=ptf_cert_paths['client_key'],
+    )
+
+    client = PtfGrpc(ptfhost, target, plaintext=False)
+    client.configure_tls_certificates(
+        ca_cert=cert_paths.ca_cert,
+        client_cert=cert_paths.client_cert,
+        client_key=cert_paths.client_key,
+    )
+    gnoi_client = PtfGnoi(client)
+
+    # PygnmiClient runs in the sonic-mgmt orchestrator and reads the locally
+    # generated certs in cert_dir (not the PTF-side copies).
+    pygnmi_client = PygnmiClient(
+        host, port, plaintext=False,
+        ca_cert=f"{cert_dir}/{grpc_config.CA_CERT}",
+        client_cert=f"{cert_dir}/{grpc_config.CLIENT_CERT}",
+        client_key=f"{cert_dir}/{grpc_config.CLIENT_KEY}",
+    )
+
+    fixture = GnmiFixture(
+        host=host,
+        port=port,
+        tls=True,
+        cert_paths=cert_paths,
+        grpc=client,
+        gnoi=gnoi_client,
+        pygnmi_client=pygnmi_client,
+        transport='tls',
+        _duthost=duthost,
+        _ptfhost=ptfhost,
+        _cert_dir=cert_dir,
+    )
+
+    logger.info("Constructed PygnmiClient: %s", pygnmi_client)
+    logger.info("gNOI TLS server setup completed successfully")
+    return fixture
 
 
 @pytest.fixture(scope="function")

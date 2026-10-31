@@ -1,81 +1,18 @@
 """Opt-in, serial AAA role-case reuse; audit and lifecycle cases stay fresh."""
 
 from contextlib import contextmanager
-import json
 import logging
-import shlex
 import time
 
 import pytest
 
-from tests.common.fixtures.grpc_fixtures import _get_target_duthost, _gnmi_tls_flow
-from tests.common.helpers.sonic_db import CONFIG_DB, redis_del, redis_hdel, redis_hset
+from tests.common.fixtures.grpc_fixtures import _get_target_duthost, _gnmi_same_image_tls_flow
 from tests.common.plugins.loganalyzer.loganalyzer import LogAnalyzer
 
 logger = logging.getLogger(__name__)
 PRINCIPAL = "test.client.gnmi.sonic"
 ROLE_KEY = "GNMI_CLIENT_CERT|{}".format(PRINCIPAL)
 METADATA_KEY = "DEVICE_METADATA|localhost"
-
-
-def _running_config(duthost):
-    # Do not use miss-tolerant HGET helpers: failure must not look like absence,
-    # and empty values must remain distinct from absent fields.
-    result = duthost.shell("sonic-cfggen -d --print-data", module_ignore_errors=True)
-    if result.get("rc", 1) != 0:
-        raise RuntimeError("Cannot snapshot AAA configuration: {}".format(result))
-    config = json.loads(result["stdout"])
-    if not isinstance(config, dict):
-        raise ValueError("AAA configuration snapshot is not an object")
-    return config
-
-
-def _principal_mapping(duthost):
-    # cfggen decodes Redis "role@" into a "role" list and drops NULL sentinels.
-    # Read the raw hash separately; JSON encoding inside Redis preserves empty
-    # strings, delimiters and quotes without relying on CLI HGETALL formatting.
-    script = "return cjson.encode(redis.call('HGETALL', KEYS[1]))"
-    result = duthost.shell(
-        "sonic-db-cli CONFIG_DB EVAL {} 1 {}".format(shlex.quote(script), shlex.quote(ROLE_KEY)),
-        module_ignore_errors=True,
-    )
-    if result.get("rc", 1) != 0:
-        raise RuntimeError("Cannot snapshot AAA principal: {}".format(result))
-    fields = json.loads(result["stdout"])
-    # Redis cjson encodes an empty Lua table as {}, not []. Both mean no hash.
-    if fields == {}:
-        return {}
-    if (not isinstance(fields, list) or len(fields) % 2
-            or not all(isinstance(value, str) for value in fields)
-            or len(set(fields[::2])) != len(fields) // 2):
-        raise ValueError("Invalid raw AAA principal snapshot")
-    return dict(zip(fields[::2], fields[1::2]))
-
-
-def _checked(result):
-    if result.get("rc", 1) != 0:
-        raise RuntimeError("AAA state restoration failed: {}".format(result))
-
-
-def _restore_case(duthost, before, mapping):
-    """Restore only the two owned mutations, leaving unrelated leaks visible."""
-    errors = []
-    metadata = before["DEVICE_METADATA"]["localhost"]
-    try:
-        _checked(redis_del(duthost, CONFIG_DB, ROLE_KEY)[0])
-        if mapping:
-            _checked(redis_hset(duthost, CONFIG_DB, ROLE_KEY, **mapping))
-    except Exception as error:
-        errors.append(str(error))
-    try:
-        if "cloudtype" in metadata:
-            _checked(redis_hset(duthost, CONFIG_DB, METADATA_KEY, cloudtype=metadata["cloudtype"]))
-        else:
-            _checked(redis_hdel(duthost, CONFIG_DB, METADATA_KEY, "cloudtype"))
-    except Exception as error:
-        errors.append(str(error))
-    if errors:
-        raise RuntimeError("AAA case cleanup failed: {}".format("; ".join(errors)))
 
 
 class _RoleTlsOwner:
@@ -88,18 +25,17 @@ class _RoleTlsOwner:
     pytest may continue sharing; setup or cleanup failures poison the owner.
     """
 
-    def __init__(self):
+    def __init__(self, verifier=None):
+        self.verifier = verifier
         self.flow = None
         self.fixture = None
-        self.expected = None
-        self.mapping = None
         self.broken = False
         self.log_request = None
         self.log_analyzer = None
 
     def close(self):
         flow, self.flow = self.flow, None
-        self.fixture = self.expected = self.mapping = None
+        self.fixture = None
         if flow is not None:
             try:
                 next(flow)
@@ -146,16 +82,10 @@ class _RoleTlsOwner:
             raise RuntimeError("AAA TLS cleanup failed; refusing further reuse")
         if self.flow is None:
             duthost = _get_target_duthost(duthosts, request)
-            self.flow = _gnmi_tls_flow(duthost, ptfhost, strict_cleanup=True)
+            self.flow = _gnmi_same_image_tls_flow(duthost, ptfhost, verifier=self.verifier)
             try:
                 self.fixture = next(self.flow)
-                self.expected = _running_config(duthost)
-                self.mapping = _principal_mapping(duthost)
-                if not self.mapping.get("role@"):
-                    raise AssertionError("Shared TLS client certificate role is not configured")
-                # Validate the restoration target before allowing a mutation.
-                if not isinstance(self.expected["DEVICE_METADATA"]["localhost"], dict):
-                    raise ValueError("Invalid DEVICE_METADATA restoration target")
+                self.fixture._same_image_state.case_save()
             except BaseException:
                 # A failed generator may already be exhausted after failed
                 # cleanup; conservatively forbid another setup in this module.
@@ -170,13 +100,10 @@ class _RoleTlsOwner:
     @contextmanager
     def case(self, duthosts, ptfhost, request):
         fixture = self.acquire(duthosts, ptfhost, request)
-        duthost = fixture.duthost
         try:
             try:
                 fixture.pygnmi_client.close()
-                if (_running_config(duthost) != self.expected
-                        or _principal_mapping(duthost) != self.mapping):
-                    raise AssertionError("Unexpected configuration before shared AAA case")
+                fixture._same_image_state.case_verify()
             except BaseException:
                 self.broken = True
                 raise
@@ -191,10 +118,8 @@ class _RoleTlsOwner:
                     raise
                 finally:
                     try:
-                        _restore_case(duthost, self.expected, self.mapping)
-                        if (_running_config(duthost) != self.expected
-                                or _principal_mapping(duthost) != self.mapping):
-                            raise AssertionError("Unrelated configuration leak in shared AAA case")
+                        fixture._same_image_state.case_restore()
+                        fixture._same_image_state.case_verify()
                     except BaseException:
                         # Do not let a later case hide failed restoration or an
                         # unrelated leak even if the outer rollback succeeds.
@@ -207,9 +132,9 @@ class _RoleTlsOwner:
 
 
 @pytest.fixture(scope="module")
-def gnmi_aaa_tls_owner(core_dump_and_config_check):
+def gnmi_aaa_tls_owner(core_dump_and_config_check, gnmi_original_service_verifier):
     # Explicit ordering: restore TLS before generic config checking/recovery.
-    owner = _RoleTlsOwner()
+    owner = _RoleTlsOwner(verifier=gnmi_original_service_verifier)
     try:
         yield owner
     finally:

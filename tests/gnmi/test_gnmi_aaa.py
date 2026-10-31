@@ -15,7 +15,10 @@ from tests.common.fixtures.gnmi_aaa import (  # noqa: F401
 )
 from tests.common.fixtures.grpc_fixtures import (  # noqa: F401
     _restart_gnoi_server,
-    gnmi_tls,
+    gnmi_original_service_verifier,
+)
+from tests.common.fixtures.grpc_fixtures import (  # noqa: F401
+    gnmi_same_image_tls as gnmi_tls,
 )
 from tests.common.helpers.assertions import pytest_assert
 from tests.common.helpers.gnmi_audit import (

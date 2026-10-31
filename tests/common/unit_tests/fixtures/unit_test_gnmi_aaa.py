@@ -26,6 +26,71 @@ def _source(path, names=None):
     return ast.unparse(tree)
 
 
+# Historical serialization model, used only by offline owner tests.
+LEGACY_CASE_MODEL = r'''
+def _running_config(duthost):
+    # Do not use miss-tolerant HGET helpers: failure must not look like absence,
+    # and empty values must remain distinct from absent fields.
+    result = duthost.shell("sonic-cfggen -d --print-data", module_ignore_errors=True)
+    if result.get("rc", 1) != 0:
+        raise RuntimeError("Cannot snapshot AAA configuration: {}".format(result))
+    config = json.loads(result["stdout"])
+    if not isinstance(config, dict):
+        raise ValueError("AAA configuration snapshot is not an object")
+    return config
+
+
+def _principal_mapping(duthost):
+    # cfggen decodes Redis "role@" into a "role" list and drops NULL sentinels.
+    # Read the raw hash separately; JSON encoding inside Redis preserves empty
+    # strings, delimiters and quotes without relying on CLI HGETALL formatting.
+    script = "return cjson.encode(redis.call('HGETALL', KEYS[1]))"
+    result = duthost.shell(
+        "sonic-db-cli CONFIG_DB EVAL {} 1 {}".format(shlex.quote(script), shlex.quote(ROLE_KEY)),
+        module_ignore_errors=True,
+    )
+    if result.get("rc", 1) != 0:
+        raise RuntimeError("Cannot snapshot AAA principal: {}".format(result))
+    fields = json.loads(result["stdout"])
+    # Redis cjson encodes an empty Lua table as {}, not []. Both mean no hash.
+    if fields == {}:
+        return {}
+    if (not isinstance(fields, list) or len(fields) % 2
+            or not all(isinstance(value, str) for value in fields)
+            or len(set(fields[::2])) != len(fields) // 2):
+        raise ValueError("Invalid raw AAA principal snapshot")
+    return dict(zip(fields[::2], fields[1::2]))
+
+
+def _checked(result):
+    if result.get("rc", 1) != 0:
+        raise RuntimeError("AAA state restoration failed: {}".format(result))
+
+
+def _restore_case(duthost, before, mapping):
+    """Restore only the two owned mutations, leaving unrelated leaks visible."""
+    errors = []
+    metadata = before["DEVICE_METADATA"]["localhost"]
+    try:
+        _checked(redis_del(duthost, CONFIG_DB, ROLE_KEY)[0])
+        if mapping:
+            _checked(redis_hset(duthost, CONFIG_DB, ROLE_KEY, **mapping))
+    except Exception as error:
+        errors.append(str(error))
+    try:
+        if "cloudtype" in metadata:
+            _checked(redis_hset(duthost, CONFIG_DB, METADATA_KEY, cloudtype=metadata["cloudtype"]))
+        else:
+            _checked(redis_hdel(duthost, CONFIG_DB, METADATA_KEY, "cloudtype"))
+    except Exception as error:
+        errors.append(str(error))
+    if errors:
+        raise RuntimeError("AAA case cleanup failed: {}".format("; ".join(errors)))
+
+
+'''
+
+
 def _load():
     from contextlib import contextmanager
     import logging
@@ -35,6 +100,7 @@ def _load():
     exec(compile(_source(AAA), str(AAA), "exec"), ns)
     # Integration pytest.ini uses a custom LogRecord field supplied by its
     # conftest. The offline harness intentionally does not load that plugin.
+    exec(LEGACY_CASE_MODEL, ns)
     ns["logger"] = Mock()
     return ns
 
@@ -87,7 +153,7 @@ def environment():
         return {"rc": 0}
 
     ns.update(
-        _gnmi_tls_flow=flow, _get_target_duthost=lambda *args: dut,
+        _gnmi_same_image_tls_flow=flow, _get_target_duthost=lambda *args: dut,
         redis_del=lambda host, db, key: [mutate(key, delete=True)],
         redis_hset=lambda host, db, key, **fields: mutate(key, fields),
     )
@@ -98,6 +164,19 @@ def environment():
         return {"rc": 0}
 
     ns["redis_hdel"] = hdel
+
+    class CaseState:
+        def case_save(self):
+            self.expected = ns['_running_config'](dut)
+            self.mapping = ns['_principal_mapping'](dut)
+
+        def case_verify(self):
+            if ns['_running_config'](dut) != self.expected or ns['_principal_mapping'](dut) != self.mapping:
+                raise AssertionError('Unrelated configuration leak before shared case')
+
+        def case_restore(self):
+            ns['_restore_case'](dut, self.expected, self.mapping)
+    fixture._same_image_state = CaseState()
     return SimpleNamespace(ns=ns, state=state, initial=initial, events=events,
                            dut=dut, client=client, owner=ns["_RoleTlsOwner"]())
 
@@ -207,18 +286,18 @@ def test_setup_failure_cleanup_and_teardown_failure_blocks_reuse(environment):
         finally:
             env.events.append("setup-cleanup")
 
-    env.ns["_gnmi_tls_flow"] = failed_flow
+    env.ns["_gnmi_same_image_tls_flow"] = failed_flow
     with pytest.raises(ValueError, match="setup"):
         env.owner.acquire(None, None, None)
     assert env.events == ["setup-cleanup"]
 
     def failed_cleanup(*args, **kwargs):
-        yield SimpleNamespace(duthost=env.dut, pygnmi_client=env.client)
+        yield SimpleNamespace(duthost=env.dut, pygnmi_client=env.client, _same_image_state=Mock())
         raise ValueError("cleanup")
 
     assert env.owner.broken
     env.owner = env.ns["_RoleTlsOwner"]()
-    env.ns["_gnmi_tls_flow"] = failed_cleanup
+    env.ns["_gnmi_same_image_tls_flow"] = failed_cleanup
     env.owner.acquire(None, None, None)
     with pytest.raises(ValueError, match="cleanup"):
         env.owner.close()
@@ -235,11 +314,11 @@ def test_raw_mapping_and_decoded_config_are_distinct(environment):
     env.state.update(deepcopy(env.initial))
     for _ in range(2):
         with env.owner.case(None, None, None):
-            decoded = env.owner.expected["GNMI_CLIENT_CERT"][env.ns["PRINCIPAL"]]
+            decoded = env.owner.fixture._same_image_state.expected["GNMI_CLIENT_CERT"][env.ns["PRINCIPAL"]]
             assert decoded["role"] == ["admin", "operator"]
             assert decoded["extra"] == "preserve"
             assert "role@" not in decoded and "NULL" not in decoded
-            assert env.owner.mapping == raw
+            assert env.owner.fixture._same_image_state.mapping == raw
             env.state["GNMI_CLIENT_CERT"].clear()
         assert env.state == env.initial
     env.owner.close()
@@ -294,7 +373,7 @@ def test_setup_cleanup_failure_poisoned(environment):
         finally:
             raise RuntimeError("cleanup")
 
-    env.ns["_gnmi_tls_flow"] = failed_flow
+    env.ns["_gnmi_same_image_tls_flow"] = failed_flow
     with pytest.raises(RuntimeError, match="cleanup"):
         env.owner.acquire(None, None, None)
     assert env.owner.broken and env.owner.flow is None
@@ -339,7 +418,7 @@ def test_actual_tls_flow_cleanup(strict, failure):
                "certs": ns["_delete_gnoi_certs"],
                "health-pytest": ns["wait_critical_processes"]}[failure]
     failing.side_effect = pytest.fail.Exception(failure) if failure == "health-pytest" else ValueError(failure)
-    exec(compile(_source(GRPC, {"_gnmi_tls_flow"}), str(GRPC), "exec"), ns)
+    exec(compile(_source(GRPC, {"_gnmi_tls_flow", "_tls_client_fixture"}), str(GRPC), "exec"), ns)
     flow = ns["_gnmi_tls_flow"](SimpleNamespace(mgmt_ip="::1"), Mock(), strict_cleanup=strict)
     if failure == "setup":
         with pytest.raises(ValueError, match="setup"):
@@ -389,11 +468,13 @@ def test_real_pytest_scope_ordering(tmp_path, order, failure):
         dut = SimpleNamespace(hostname='dut', shell=lambda command, **k: {'rc': 0, 'stdout': json.dumps(
             ['role@', 'admin'] if ' EVAL ' in command else state)})
         _get_target_duthost = lambda *args: dut
-        def _gnmi_tls_flow(*args, **kwargs):
+        def _gnmi_same_image_tls_flow(*args, **kwargs):
             events.append('shared-start')
             try:
                 if failure == 'setup': raise ValueError('injected-setup')
-                yield SimpleNamespace(duthost=dut, pygnmi_client=SimpleNamespace(close=lambda: None))
+                yield SimpleNamespace(duthost=dut, pygnmi_client=SimpleNamespace(close=lambda: None),
+                                      _same_image_state=SimpleNamespace(case_save=lambda: None,
+                                          case_verify=lambda: None, case_restore=lambda: None))
             finally:
                 events.append('shared-stop')
                 log_events.append('shared-stop')
@@ -445,6 +526,8 @@ def test_real_pytest_scope_ordering(tmp_path, order, failure):
         # Same local autouse wrapper as the real AAA module. The fresh fixture
         # deliberately has NO dependency on the boundary: autouse must order it.
         _boundary = gnmi_aaa_case_boundary
+        @pytest.fixture(scope="module")
+        def gnmi_original_service_verifier(): return None
         @pytest.fixture
         def gnmi_tls():
             events.append('fresh-start')
@@ -551,14 +634,14 @@ def test_module_teardown_log_policy(environment, disabled, ignore_failure, store
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_module_log_failure_never_prevents_cleanup(environment, failure, cleanup_fails):
     env = environment
-    original_flow = env.ns["_gnmi_tls_flow"]
+    original_flow = env.ns["_gnmi_same_image_tls_flow"]
 
     def flow(*args, **kwargs):
         yield from original_flow(*args, **kwargs)
         if cleanup_fails:
             raise ValueError("cleanup-failure")
 
-    env.ns["_gnmi_tls_flow"] = flow
+    env.ns["_gnmi_same_image_tls_flow"] = flow
     env.owner.acquire(None, None, None)
     env.owner.log_request = SimpleNamespace(config=SimpleNamespace(getoption=lambda option: False), keywords={})
     analyzer = Mock(ignore_regex=[])
